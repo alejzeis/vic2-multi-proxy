@@ -97,9 +97,10 @@ func StartControlServer(config *ini.File, mm *Matchmaker) {
 	router.HandleFunc("/info", handleInfo).Methods("GET")
 	router.HandleFunc("/login/{username}", handleLogin) //.Methods("POST")
 	router.HandleFunc("/logout/{token}", handleLogout).Methods("GET")
+	router.HandleFunc("/renew/{token}", handleRenew).Methods("GET")
 	router.HandleFunc("/checkin/{token}", handleCheckin).Methods("GET")
-	router.HandleFunc("/host/{token}/{lobbyinfo}", handleUpdateHostStatus) //.Methods("PUT")
-	router.HandleFunc("/link/{token}/{lobbyid}", handleUpdateLinkStatus)   //.Methods("PUT")
+	router.HandleFunc("/host/{token}", handleUpdateHostStatus)           //.Methods("PUT")
+	router.HandleFunc("/link/{token}/{lobbyid}", handleUpdateLinkStatus) //.Methods("PUT")
 
 	portKey, err := config.Section("server").GetKey("port")
 	if err != nil {
@@ -131,6 +132,11 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // Handles a login from a client and issues a JWT with their username
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted the username variable in the path (/login/[username])
+//   - 409 Conflict: There's already a valid token that exists for the client (already logged in)
+//   - 500 Internal Server Error: Failed to encode the JWT
+//   - 201 Created: Successfully created user entry, and returns a JWT for use with other REST methods
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -146,14 +152,20 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, exists := matchmaker.users[username]
+	foundUser, exists := matchmaker.users[username]
 	if exists {
-		w.WriteHeader(http.StatusConflict)
-		return
+		// Check to see if the token is expired for this user, if it is, reset all their information and continue
+		if time.Now().After(foundUser.LastTokenAt) {
+			// token expired and wasn't renewed, delete the entry
+			delete(matchmaker.users, username)
+		} else {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
 	}
 
 	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
-		"iss": "vic2multi-proxy",
+		"iss": SoftwareName,
 		"sub": username,
 		"iat": time.Now().Unix(),
 		"exp": time.Now().Local().Add(time.Minute * 2).Unix(),
@@ -184,6 +196,11 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // Called by any client with their JWT to logout of their session on the proxy server.
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted the token variable in the path (/logout/[token])
+//   - 403 Forbidden: JWT wasn't valid
+//   - 404 Not Found: Username wasn't found in the program's map
+//   - 200 OK: Successfully logged out
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -197,15 +214,8 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	valid, username := verifyToken(token)
-	if !valid {
-		w.WriteHeader(http.StatusForbidden)
-		return
-	}
-
-	user, exists := matchmaker.users[username]
-	if !exists {
-		w.WriteHeader(http.StatusNotFound)
+	success, user := authMethodVerification(token, w)
+	if !success {
 		return
 	}
 
@@ -223,15 +233,68 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.WithFields(log.Fields{
-		"username": username,
+		"username": user.Username,
 		"address":  r.RemoteAddr,
 	}).Info("New Logout")
 
-	delete(matchmaker.users, username)
+	delete(matchmaker.users, user.Username)
 	w.WriteHeader(http.StatusOK)
 }
 
+// Used by a client to renew their authentication token (JWT), should be called every minute or so
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted the token variable in the path (/renew/[token])
+//   - 403 Forbidden: JWT wasn't valid
+//   - 404 Not Found: Username wasn't found in the program's map
+//   - 500 Internal Server Error: Failed to encode the JWT
+//   - 200 OK: Successfully created new token, returns new JWT
+func handleRenew(w http.ResponseWriter, r *http.Request) {
+	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
+	matchmaker.mutex.Lock()
+	defer matchmaker.mutex.Unlock()
+
+	vars := mux.Vars(r)
+	token := vars["token"]
+	// Verify REST parameters
+	if token == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// Verify token
+	success, user := authMethodVerification(token, w)
+	if !success {
+		return
+	}
+
+	issuedTime := time.Now()
+	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
+		"iss": SoftwareName,
+		"sub": user.Username,
+		"iat": issuedTime.Unix(),
+		"exp": issuedTime.Local().Add(time.Minute * 2).Unix(),
+	})
+
+	signedToken, err := t.SignedString(secret)
+	if err != nil {
+		log.WithField("username", user.Username).WithError(err).Error("Failed to encode JWT for renewal.")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	user.LastTokenAt = issuedTime
+	matchmaker.users[user.Username] = user
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, signedToken)
+}
+
 // Called by any client every 2 seconds with their JWT, returns a list of lobbies on the server and their client's status (hosting, linked, or neither)
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted the token variable in the path (/checkin/[token])
+//   - 403 Forbidden: JWT wasn't valid
+//   - 404 Not Found: Username wasn't found in the program's map
+//   - 200 OK: Success, returns checkinResponse struct (JSON)
 func handleCheckin(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -284,6 +347,11 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 }
 
 // Called by any client when they want to host a lobby for linking on the proxy, or unhost their lobby.
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted the token variable in the path (/host/[token])
+//   - 403 Forbidden: JWT wasn't valid
+//   - 404 Not Found: Username wasn't found in the program's map
+//   - 200 OK: Successfully logged out
 func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -291,10 +359,9 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	token := vars["token"]
-	lobbyinfo := vars["lobbyinfo"]
 
 	// Verify REST parameters
-	if token == "" || lobbyinfo == "" {
+	if token == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -303,10 +370,19 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 	if !success {
 		return
 	}
+
+	w.WriteHeader(http.StatusNotImplemented)
 }
 
 // Called by any client when they want to link to a lobby, or unlink from one.
-// Note: The client MUST NOT be hosting a lobby at the same time.
+// Note: The client MUST NOT be hosting a lobby at the same time, returns 409 if client is hosting
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted a variable in the path (/link/[token]/[lobbyid]), or lobbyid is not a greater than zero integer
+//   - 403 Forbidden: JWT wasn't valid
+//   - 404 Not Found: No lobby was found with the matching ID
+//   - 409 Conflict: User is hosting a lobby, can't link while hosting
+//   - 423 Locked: Lobby the client wants to link to is password-protected (TODO)
+//   - 204 No content: Successfully linked to lobby
 func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -314,16 +390,46 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	token := vars["token"]
-	lobbyid := vars["lobbyid"]
+	lobbyid, err := strconv.ParseUint(vars["lobbyid"], 10, 64)
 
 	// Verify REST parameters
-	if token == "" || lobbyid == "" {
+	if err != nil || token == "" || lobbyid < 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	success, _ := authMethodVerification(token, w)
+	success, user := authMethodVerification(token, w)
 	if !success {
 		return
 	}
+
+	// Check to make sure the lobby actually exists
+	lobbyIdExists := false
+	for key := range matchmaker.lobbies {
+		if key == lobbyid {
+			lobbyIdExists = true
+			break
+		}
+	}
+
+	if !lobbyIdExists {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// TODO: PASSWORD PROTECTED LOBBIES SUPPORt
+	if matchmaker.lobbies[lobbyid].Password != "" {
+		w.WriteHeader(http.StatusLocked)
+		return
+	}
+
+	if user.Hosting > 0 { // Check to see if they are hosting a lobby
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+
+	user.Linkedto = lobbyid
+	matchmaker.users[user.Username] = user
+
+	w.WriteHeader(http.StatusNoContent)
 }
