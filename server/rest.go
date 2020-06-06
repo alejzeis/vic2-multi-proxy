@@ -38,7 +38,8 @@ type restLobby struct {
 var infoResponseJSON []byte // Cached bytes of the JSON for the /info response
 
 var matchmaker *Matchmaker
-var secret []byte // HMAC secret used for signing JWTs
+var secret []byte             // HMAC secret used for signing JWTs
+var lobbyIdCounter uint64 = 1 // Counter for setting lobby Ids
 
 func verifyToken(tokenStr string) (bool, string) {
 	decodedToken, err := jwt.ParseWithClaims(tokenStr, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
@@ -84,6 +85,35 @@ func authMethodVerification(tokenStr string, w http.ResponseWriter) (bool, User)
 	return true, user
 }
 
+// Executes every 20 seconds and searches for users that haven't renewed their tokens, and deletes them so they can relogin again
+func findExpiredUserSessions() {
+	ticker := time.NewTicker(20 * time.Second)
+	for range ticker.C {
+		matchmaker.mutex.Lock()
+
+		for _, user := range matchmaker.users {
+			expireTime := user.LastTokenAt.Add(2 * time.Minute)
+			if time.Now().After(expireTime) {
+				// Expire time is past the current time, their token has expired, time to delete the user
+				if user.Hosting > 0 {
+					// They are hosting a lobby, need to delete that too
+					delete(matchmaker.lobbies, user.Hosting)
+				}
+				delete(matchmaker.users, user.Username)
+
+				log.WithFields(log.Fields{
+					"username":   user.Username,
+					"hosting":    user.Hosting,
+					"linked":     user.Linkedto,
+					"expireTime": expireTime,
+				}).Info("Removed expired user session")
+			}
+		}
+
+		matchmaker.mutex.Unlock()
+	}
+}
+
 // StartControlServer begins handling HTTP requests for the REST API, called by main function
 func StartControlServer(config *ini.File, mm *Matchmaker) {
 	log.Info("Starting REST API HTTP Server...")
@@ -91,6 +121,7 @@ func StartControlServer(config *ini.File, mm *Matchmaker) {
 	infoResponseJSON, _ = json.Marshal(infoResponse{SoftwareName, SoftwareVersion, APIVersion})
 
 	mm.users = make(map[string]User)
+	mm.lobbies = make(map[uint64]Lobby)
 	matchmaker = mm
 
 	router := mux.NewRouter().StrictSlash(true)
@@ -99,7 +130,8 @@ func StartControlServer(config *ini.File, mm *Matchmaker) {
 	router.HandleFunc("/logout/{token}", handleLogout).Methods("GET")
 	router.HandleFunc("/renew/{token}", handleRenew).Methods("GET")
 	router.HandleFunc("/checkin/{token}", handleCheckin).Methods("GET")
-	router.HandleFunc("/host/{token}", handleUpdateHostStatus)           //.Methods("PUT")
+	router.HandleFunc("/host/{token}", handleUpdateHostStatus).Methods("PUT")
+	router.HandleFunc("/host/{token}", handleDeleteHostStatus).Methods("DELETE")
 	router.HandleFunc("/link/{token}/{lobbyid}", handleUpdateLinkStatus) //.Methods("PUT")
 
 	portKey, err := config.Section("server").GetKey("port")
@@ -120,6 +152,8 @@ func StartControlServer(config *ini.File, mm *Matchmaker) {
 	}
 
 	secret = []byte(secretKey.String())
+
+	go findExpiredUserSessions()
 
 	log.WithError(http.ListenAndServe(":"+strconv.Itoa(port), router)).WithField("port", port).Error("Failed to start listening")
 }
@@ -152,16 +186,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	foundUser, exists := matchmaker.users[username]
+	_, exists := matchmaker.users[username]
 	if exists {
-		// Check to see if the token is expired for this user, if it is, reset all their information and continue
-		if time.Now().After(foundUser.LastTokenAt) {
-			// token expired and wasn't renewed, delete the entry
-			delete(matchmaker.users, username)
-		} else {
-			w.WriteHeader(http.StatusConflict)
-			return
-		}
+		w.WriteHeader(http.StatusConflict)
+		return
 	}
 
 	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
@@ -346,12 +374,14 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// Called by any client when they want to host a lobby for linking on the proxy, or unhost their lobby.
+// Called by any client when they want to host a lobby for linking on the proxy
+// HTTP PUT Method
 // HTTP Responses:
 //   - 400 Bad Request: Client omitted the token variable in the path (/host/[token])
 //   - 403 Forbidden: JWT wasn't valid
 //   - 404 Not Found: Username wasn't found in the program's map
-//   - 200 OK: Successfully logged out
+//   - 409 Conflict: User is linked to a lobby, or is already hosting
+//   - 204 No content: Successfully hosting lobby
 func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -366,12 +396,87 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	success, _ := authMethodVerification(token, w)
+	success, user := authMethodVerification(token, w)
 	if !success {
 		return
 	}
 
-	w.WriteHeader(http.StatusNotImplemented)
+	// Make sure they aren't already hosting a lobby or are linked to one
+	if user.Hosting > 0 || user.Linkedto > 0 {
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+
+	r.ParseForm()
+	if r.FormValue("name") == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	lobby := Lobby{
+		ID:           lobbyIdCounter,
+		Name:         r.FormValue("name"),
+		Password:     r.FormValue("password"),
+		HostUsername: user.Username,
+	}
+
+	matchmaker.lobbies[lobbyIdCounter] = lobby
+	user.Hosting = lobbyIdCounter
+	matchmaker.users[user.Username] = user
+	lobbyIdCounter++
+
+	log.WithFields(log.Fields{
+		"username": user.Username,
+		"lobby":    r.FormValue("name"),
+	}).Info("New lobby created")
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Called by any client when they want to stop hosting a lobby.
+// HTTP DELETE Method
+// HTTP Responses:
+//   - 400 Bad Request: Client omitted the token variable in the path (/host/[token])
+//   - 403 Forbidden: JWT wasn't valid
+//   - 404 Not Found: Username wasn't found in the program's map, or user isn't hosting a lobby
+//   - 204 No content: Successfully deleted lobby
+func handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
+	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
+	matchmaker.mutex.Lock()
+	defer matchmaker.mutex.Unlock()
+
+	vars := mux.Vars(r)
+	token := vars["token"]
+
+	// Verify REST parameters
+	if token == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	success, user := authMethodVerification(token, w)
+	if !success {
+		return
+	}
+
+	// Check if they are hosting
+	if user.Hosting < 1 {
+		w.WriteHeader(http.StatusNotFound) // User isn't hosting
+		return
+	}
+
+	name := matchmaker.lobbies[user.Hosting].Name
+	delete(matchmaker.lobbies, user.Hosting)
+
+	user.Hosting = 0
+	matchmaker.users[user.Username] = user
+
+	log.WithFields(log.Fields{
+		"username": user.Username,
+		"lobby":    name,
+	}).Info("Lobby deleted")
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Called by any client when they want to link to a lobby, or unlink from one.
@@ -403,6 +508,25 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if user.Hosting > 0 { // Check to see if they are hosting a lobby
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+
+	if lobbyid == 0 {
+		// They want to unlink from their lobby
+		oldLobby := user.Linkedto
+		user.Linkedto = 0
+		matchmaker.users[user.Username] = user
+		w.WriteHeader(http.StatusNoContent)
+
+		log.WithFields(log.Fields{
+			"username": user.Username,
+			"lobby":    oldLobby,
+		}).Info("Unlinked from lobby")
+		return
+	}
+
 	// Check to make sure the lobby actually exists
 	lobbyIdExists := false
 	for key := range matchmaker.lobbies {
@@ -417,19 +541,19 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: PASSWORD PROTECTED LOBBIES SUPPORt
+	// TODO: PASSWORD PROTECTED LOBBIES SUPPORT
 	if matchmaker.lobbies[lobbyid].Password != "" {
 		w.WriteHeader(http.StatusLocked)
 		return
 	}
 
-	if user.Hosting > 0 { // Check to see if they are hosting a lobby
-		w.WriteHeader(http.StatusConflict)
-		return
-	}
-
 	user.Linkedto = lobbyid
 	matchmaker.users[user.Username] = user
+
+	log.WithFields(log.Fields{
+		"username": user.Username,
+		"lobby":    user.Linkedto,
+	}).Info("Linked to lobby")
 
 	w.WriteHeader(http.StatusNoContent)
 }
