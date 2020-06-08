@@ -5,35 +5,16 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
+
+	"github.com/jython234/vic2-multi-proxy/common"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/ini.v1"
 )
-
-// APIVersion is the version of the REST API implemented in this file
-const APIVersion uint = 1
-
-// infoResponse is the JSON response to the /info REST method
-type infoResponse struct {
-	Software string `json:"software"`
-	Version  string `json:"version"`
-	API      uint   `json:"apiVersion"`
-}
-
-// checkinResponse is the JSON response to the /checkin REST method
-type checkinResponse struct {
-	Lobbies     map[string]restLobby `json:"lobbies"`
-	Hosting     bool                 `json:"hosting"`
-	LinkedLobby uint64               `json:"linkedTo"`
-}
-
-type restLobby struct {
-	Name string `json:"name"`
-	Host string `json:"host"`
-}
 
 var infoResponseJSON []byte // Cached bytes of the JSON for the /info response
 
@@ -118,21 +99,22 @@ func findExpiredUserSessions() {
 func StartControlServer(config *ini.File, mm *Matchmaker) {
 	log.Info("Starting REST API HTTP Server...")
 
-	infoResponseJSON, _ = json.Marshal(infoResponse{SoftwareName, SoftwareVersion, APIVersion})
+	infoResponseJSON, _ = json.Marshal(common.InfoResponse{common.SoftwareName, common.SoftwareVersion, common.APIVersion})
 
+	mm.mutex = &sync.Mutex{}
 	mm.users = make(map[string]User)
 	mm.lobbies = make(map[uint64]Lobby)
 	matchmaker = mm
 
 	router := mux.NewRouter().StrictSlash(true)
 	router.HandleFunc("/info", handleInfo).Methods("GET")
-	router.HandleFunc("/login/{username}", handleLogin) //.Methods("POST")
+	router.HandleFunc("/login/{username}", handleLogin).Methods("POST")
 	router.HandleFunc("/logout/{token}", handleLogout).Methods("GET")
 	router.HandleFunc("/renew/{token}", handleRenew).Methods("GET")
 	router.HandleFunc("/checkin/{token}", handleCheckin).Methods("GET")
 	router.HandleFunc("/host/{token}", handleUpdateHostStatus).Methods("PUT")
 	router.HandleFunc("/host/{token}", handleDeleteHostStatus).Methods("DELETE")
-	router.HandleFunc("/link/{token}/{lobbyid}", handleUpdateLinkStatus) //.Methods("PUT")
+	router.HandleFunc("/link/{token}/{lobbyid}", handleUpdateLinkStatus).Methods("PUT")
 
 	portKey, err := config.Section("server").GetKey("port")
 	if err != nil {
@@ -193,7 +175,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
-		"iss": SoftwareName,
+		"iss": common.SoftwareName,
 		"sub": username,
 		"iat": time.Now().Unix(),
 		"exp": time.Now().Local().Add(time.Minute * 2).Unix(),
@@ -297,7 +279,7 @@ func handleRenew(w http.ResponseWriter, r *http.Request) {
 
 	issuedTime := time.Now()
 	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
-		"iss": SoftwareName,
+		"iss": common.SoftwareName,
 		"sub": user.Username,
 		"iat": issuedTime.Unix(),
 		"exp": issuedTime.Local().Add(time.Minute * 2).Unix(),
@@ -341,9 +323,9 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lobbyMap := make(map[string]restLobby)
+	lobbyMap := make(map[string]common.RestLobby)
 	for _, val := range matchmaker.lobbies {
-		lobbyMap[strconv.FormatUint(val.ID, 10)] = restLobby{val.Name, val.HostUsername}
+		lobbyMap[strconv.FormatUint(val.ID, 10)] = common.RestLobby{val.Name, val.HostUsername}
 	}
 
 	var isHosting bool
@@ -353,7 +335,7 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 		isHosting = false
 	}
 
-	data, err := json.Marshal(checkinResponse{
+	data, err := json.Marshal(common.CheckinResponse{
 		Lobbies:     lobbyMap,
 		Hosting:     isHosting,
 		LinkedLobby: user.Linkedto,

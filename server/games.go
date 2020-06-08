@@ -27,5 +27,5 @@ type Lobby struct {
 type Matchmaker struct {
 	users   map[string]User
 	lobbies map[uint64]Lobby
-	mutex   sync.Mutex
+	mutex   *sync.Mutex
 }

@@ -1,4 +1,4 @@
-module github.com/jython234/vic2proxy
+module github.com/jython234/vic2-multi-proxy
 
 go 1.14
 
@@ -10,4 +10,5 @@ require (
 	github.com/sirupsen/logrus v1.6.0
 	github.com/smartystreets/goconvey v1.6.4 // indirect
 	gopkg.in/ini.v1 v1.56.0
+	github.com/go-resty/resty/v2 v2.3.0
 )

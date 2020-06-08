@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 
-	"github.com/jython234/vic2proxy/server"
+	"github.com/jython234/vic2-multi-proxy/client"
+	"github.com/jython234/vic2-multi-proxy/common"
+	"github.com/jython234/vic2-multi-proxy/server"
 
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/ini.v1"
@@ -18,16 +20,25 @@ func main() {
 		FullTimestamp: true,
 	})
 
-	config := loadConfig()
-	matchmaker := new(server.Matchmaker)
-
-	server.StartControlServer(config, matchmaker)
 	if len(os.Args) > 1 && os.Args[1] == "-server" {
-		runServer()
-	} else if len(os.Args) > 1 && os.Args[1] == "-host" {
-		runClient(true)
+		log.WithFields(log.Fields{
+			"software": common.SoftwareName,
+			"version":  common.SoftwareVersion,
+			"mode":     "server",
+		}).Info("Starting...")
+
+		config := loadConfig()
+		matchmaker := new(server.Matchmaker)
+
+		server.StartControlServer(config, matchmaker)
 	} else {
-		runClient(false)
+		log.WithFields(log.Fields{
+			"software": common.SoftwareName,
+			"version":  common.SoftwareVersion,
+			"mode":     "client",
+		}).Info("Starting...")
+
+		client.RunClient()
 	}
 }
 
