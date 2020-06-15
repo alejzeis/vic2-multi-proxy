@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-vic2proxy
+vic2-multi-proxy
 
 # Test binary, built with `go test -c`
 *.test

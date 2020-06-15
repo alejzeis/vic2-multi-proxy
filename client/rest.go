@@ -12,22 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// keepalive goroutine that keeps renewing the auth token
-func keepalive(client *restClient) {
-	ticker := time.NewTicker(30 * time.Second)
-	for range ticker.C {
-		client.mutex.Lock()
-		if client.stop {
-			break
-		}
-
-		client.renewToken()
-
-		client.mutex.Unlock()
-	}
-}
-
-// goroutine that retrieves the latest checkin
+// goroutine that retrieves the latest checkin and renews token when applicable
 func continousCheckin(client *restClient) {
 	ticker := time.NewTicker(1 * time.Second)
 	for range ticker.C {
@@ -37,6 +22,11 @@ func continousCheckin(client *restClient) {
 		}
 
 		client.checkin()
+
+		if client.lastRenewedAt.Add(30 * time.Second).Before(time.Now()) {
+			// It's been 30 seconds, time to renew the token
+			client.renewToken()
+		}
 
 		client.mutex.Unlock()
 	}
@@ -55,9 +45,21 @@ type restClient struct {
 	mutex         *sync.Mutex
 }
 
+func createRestClient(serverURL string) *restClient {
+	client := new(restClient)
+	client.serverURL = serverURL
+	client.rest = resty.New()
+	client.mutex = &sync.Mutex{}
+	return client
+}
+
 func (r *restClient) checkConnected() bool {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+
+	if r.stop {
+		return true
+	}
 
 	expireTime := r.lastRenewedAt.Add(2 * time.Minute)
 	if time.Now().After(expireTime) {
@@ -115,9 +117,57 @@ func (r *restClient) checkin() {
 	}
 }
 
-func (r *restClient) connect() {
+func (r *restClient) connect(username string) {
 	if r.checkConnected() {
 		return
 	}
 
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	r.stop = false
+	url := r.serverURL + "/login/" + username
+	response, err := r.rest.R().Get(url)
+	if err != nil {
+		log.WithField("url", url).WithError(err).Error("Failed to login.")
+		return
+	} else if response.StatusCode() != http.StatusOK {
+		log.WithFields(log.Fields{
+			"url":    url,
+			"status": response.StatusCode,
+			"body":   response.Body,
+		}).Error("Failed to login")
+		return
+	}
+
+	log.Info("Successfully logged into server.")
+	r.authToken = response.String()
+	r.lastRenewedAt = time.Now()
+}
+
+func (r *restClient) disconnect() {
+	if !r.checkConnected() {
+		return
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	r.stop = true
+	url := r.serverURL + "/logout/" + r.authToken
+	response, err := r.rest.R().Get(url)
+	if err != nil {
+		log.WithField("url", url).WithError(err).Error("Failed to logout")
+		return
+	} else if response.StatusCode() != http.StatusNoContent {
+		log.WithFields(log.Fields{
+			"url":    url,
+			"status": response.StatusCode,
+			"body":   response.Body,
+		}).Error("Failed to logout")
+		return
+	}
+
+	log.Info("Successfully logged out of server.")
+	r.authToken = ""
 }
