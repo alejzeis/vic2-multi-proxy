@@ -18,6 +18,7 @@ func continousCheckin(client *restClient) {
 	for range ticker.C {
 		client.mutex.Lock()
 		if client.stop {
+			client.mutex.Unlock()
 			break
 		}
 
@@ -47,6 +48,7 @@ type restClient struct {
 
 func createRestClient(serverURL string) *restClient {
 	client := new(restClient)
+	client.stop = true
 	client.serverURL = serverURL
 	client.rest = resty.New()
 	client.mutex = &sync.Mutex{}
@@ -57,8 +59,8 @@ func (r *restClient) checkConnected() bool {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	if r.stop {
-		return true
+	if r.authToken == "" {
+		return false
 	}
 
 	expireTime := r.lastRenewedAt.Add(2 * time.Minute)
@@ -81,8 +83,8 @@ func (r *restClient) renewToken() {
 	} else if response.StatusCode() != http.StatusOK {
 		log.WithFields(log.Fields{
 			"url":    url,
-			"status": response.StatusCode,
-			"body":   response.Body,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
 		}).Warn("Failed to renew token")
 		return
 	}
@@ -102,8 +104,8 @@ func (r *restClient) checkin() {
 	} else if response.StatusCode() != http.StatusOK {
 		log.WithFields(log.Fields{
 			"url":    url,
-			"status": response.StatusCode,
-			"body":   response.Body,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
 		}).Warn("Failed to process checkin")
 		return
 	}
@@ -117,32 +119,40 @@ func (r *restClient) checkin() {
 	}
 }
 
-func (r *restClient) connect(username string) {
+func (r *restClient) connect(username string) bool {
 	if r.checkConnected() {
-		return
+		return false
 	}
 
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	r.stop = false
 	url := r.serverURL + "/login/" + username
-	response, err := r.rest.R().Get(url)
+	response, err := r.rest.R().Post(url)
 	if err != nil {
-		log.WithField("url", url).WithError(err).Error("Failed to login.")
-		return
-	} else if response.StatusCode() != http.StatusOK {
 		log.WithFields(log.Fields{
 			"url":    url,
-			"status": response.StatusCode,
-			"body":   response.Body,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
+		}).WithError(err).Error("Failed to login")
+		return false
+	} else if response.StatusCode() != http.StatusCreated {
+		log.WithFields(log.Fields{
+			"url":    url,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
 		}).Error("Failed to login")
-		return
+		return false
 	}
 
 	log.Info("Successfully logged into server.")
+	r.stop = false
 	r.authToken = response.String()
 	r.lastRenewedAt = time.Now()
+
+	go continousCheckin(r)
+
+	return true
 }
 
 func (r *restClient) disconnect() {
@@ -153,7 +163,6 @@ func (r *restClient) disconnect() {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	r.stop = true
 	url := r.serverURL + "/logout/" + r.authToken
 	response, err := r.rest.R().Get(url)
 	if err != nil {
@@ -162,12 +171,13 @@ func (r *restClient) disconnect() {
 	} else if response.StatusCode() != http.StatusNoContent {
 		log.WithFields(log.Fields{
 			"url":    url,
-			"status": response.StatusCode,
-			"body":   response.Body,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
 		}).Error("Failed to logout")
 		return
 	}
 
 	log.Info("Successfully logged out of server.")
+	r.stop = true
 	r.authToken = ""
 }

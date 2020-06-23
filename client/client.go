@@ -13,26 +13,38 @@ import (
 func RunClient() {
 	log.Info("Client ready for commands.")
 	scanner := bufio.NewScanner(os.Stdin)
+	client := createRestClient("")
 
 	for {
 		fmt.Print("> ")
 
 		scanner.Scan()
 		text := scanner.Text()
+
 		if len(text) != 0 {
 			if strings.HasPrefix(text, "connect") {
-				// connect [server]
-				exploded := strings.Split(text, " ")
-				if len(exploded) > 1 {
-					// TODO connect sequence
+				if client.checkConnected() {
+					log.Error("Already connected to a server, use \"disconnect\" command first")
 				} else {
-					log.Error("Usage: \"connect [URL]\"")
+					// connect [server] [username]
+					exploded := strings.Split(text, " ")
+					if len(exploded) > 2 {
+						log.WithField("url", exploded[1]).Info("Connecting to server...")
+						client.serverURL = exploded[1]
+						client.connect(exploded[2])
+					} else {
+						log.Error("Usage: \"connect [URL] [username]\"")
+					}
 				}
+			} else if strings.HasPrefix(text, "disconnect") {
+				if !client.checkConnected() {
+					log.Error("Not connected to a server, use \"connect\" command first")
+				} else {
+					client.disconnect()
+				}
+			} else {
+				log.Warn("Unknown Command")
 			}
 		}
 	}
-}
-
-func connectedMainLoop() {
-
 }

@@ -19,6 +19,7 @@ func main() {
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp: true,
 	})
+	log.SetLevel(log.DebugLevel)
 
 	if len(os.Args) > 1 && os.Args[1] == "-server" {
 		log.WithFields(log.Fields{

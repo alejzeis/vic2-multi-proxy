@@ -210,7 +210,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 //   - 400 Bad Request: Client omitted the token variable in the path (/logout/[token])
 //   - 403 Forbidden: JWT wasn't valid
 //   - 404 Not Found: Username wasn't found in the program's map
-//   - 200 OK: Successfully logged out
+//   - 204 No Content: Successfully logged out
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
 	matchmaker.mutex.Lock()
@@ -248,7 +248,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	}).Info("New Logout")
 
 	delete(matchmaker.users, user.Username)
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Used by a client to renew their authentication token (JWT), should be called every minute or so
