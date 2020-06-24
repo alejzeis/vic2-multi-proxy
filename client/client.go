@@ -42,9 +42,35 @@ func RunClient() {
 				} else {
 					client.disconnect()
 				}
+			} else if strings.HasPrefix(text, "list") {
+				processListCommand(client)
 			} else {
 				log.Warn("Unknown Command")
 			}
 		}
 	}
+}
+
+func processListCommand(client *restClient) {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+
+	if !client.checkConnectedNoLock() {
+		log.Error("Not connected to a server, use \"connect\" command first")
+	} else {
+		if len(client.lastCheckin.Lobbies) == 0 {
+			log.Info("No lobbies found")
+		} else {
+			for key, val := range client.lastCheckin.Lobbies {
+				log.WithFields(log.Fields{
+					"name": key,
+					"host": val.Host,
+				}).Info("Lobby found")
+			}
+		}
+	}
+}
+
+func processLinkCommand(client *restClient, lobbyName string) {
+
 }

@@ -73,6 +73,21 @@ func (r *restClient) checkConnected() bool {
 	return true
 }
 
+func (r *restClient) checkConnectedNoLock() bool {
+	if r.authToken == "" {
+		return false
+	}
+
+	expireTime := r.lastRenewedAt.Add(2 * time.Minute)
+	if time.Now().After(expireTime) {
+		// Token was expired, we're not connected anymore
+		r.authToken = ""
+		return false
+	}
+
+	return true
+}
+
 // not thread safe, lock the mutex before calling this
 func (r *restClient) renewToken() {
 	url := r.serverURL + "/renew/" + r.authToken
