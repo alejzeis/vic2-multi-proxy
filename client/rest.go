@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 )
 
 // goroutine that retrieves the latest checkin and renews token when applicable
-func continousCheckin(client *restClient) {
+func continuousCheckin(client *restClient) {
 	ticker := time.NewTicker(1 * time.Second)
 	for range ticker.C {
 		client.mutex.Lock()
@@ -165,7 +166,7 @@ func (r *restClient) connect(username string) bool {
 	r.authToken = response.String()
 	r.lastRenewedAt = time.Now()
 
-	go continousCheckin(r)
+	go continuousCheckin(r)
 
 	return true
 }
@@ -195,4 +196,61 @@ func (r *restClient) disconnect() {
 	log.Info("Successfully logged out of server.")
 	r.stop = true
 	r.authToken = ""
+}
+
+func (r *restClient) link(lobbyIdStr string) bool {
+	if !r.checkConnected() {
+		return false
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	url := r.serverURL + "/link/" + r.authToken + "/" + lobbyIdStr
+	response, err := r.rest.R().Put(url)
+	if err != nil || response.StatusCode() != http.StatusNoContent {
+		log.WithFields(log.Fields{
+			"url":     url,
+			"status":  response.StatusCode(),
+			"body":    response.Body(),
+			"lobbyId": lobbyIdStr,
+		}).WithError(err).Error("Failed to link to lobby")
+		return false
+	}
+
+	log.WithFields(log.Fields{
+		"id":   lobbyIdStr,
+		"name": r.lastCheckin.Lobbies[lobbyIdStr].Name,
+	}).Info("Successfully linked to lobby ")
+
+	lobbyId, _ := strconv.Atoi(lobbyIdStr)
+	r.lastCheckin.LinkedLobby = uint64(lobbyId)
+
+	return true
+}
+
+func (r *restClient) unlink() bool {
+	if !r.checkConnected() {
+		return false
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	url := r.serverURL + "/link/" + r.authToken + "/0"
+	response, err := r.rest.R().Put(url)
+	if err != nil || response.StatusCode() != http.StatusNoContent {
+		log.WithFields(log.Fields{
+			"url":    url,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
+		}).WithError(err).Error("Failed to unlink")
+		return false
+	}
+
+	log.Info("Successfully unlinked from lobby")
+
+	r.lastCheckin.LinkedLobby = 0
+
+	return true
 }

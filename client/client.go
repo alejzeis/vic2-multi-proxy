@@ -44,6 +44,21 @@ func RunClient() {
 				}
 			} else if strings.HasPrefix(text, "list") {
 				processListCommand(client)
+			} else if strings.HasPrefix(text, "link") {
+				// link [name]
+				exploded := strings.Split(text, " ")
+				if len(exploded) > 1 {
+					processLinkCommand(client, exploded[1])
+				} else {
+					log.Error("Usage: \"link [lobby Name]\"")
+				}
+			} else if strings.HasPrefix(text, "unlink") {
+				if !client.checkConnected() || client.lastCheckin.LinkedLobby < 1 {
+					log.Error("You must be connected to a server and linked to lobby first.")
+				} else {
+					client.unlink()
+					// TODO Stop TCP tunnel of data
+				}
 			} else {
 				log.Warn("Unknown Command")
 			}
@@ -72,5 +87,32 @@ func processListCommand(client *restClient) {
 }
 
 func processLinkCommand(client *restClient, lobbyName string) {
+	client.mutex.Lock()
 
+	if !client.checkConnectedNoLock() {
+		log.Error("Not connected to a server, use \"connect\" command first")
+	} else {
+		foundLobby := ""
+
+		for id, lobby := range client.lastCheckin.Lobbies {
+			if strings.ToLower(lobbyName) == lobby.Name {
+				foundLobby = id
+			}
+		}
+
+		if foundLobby != "" {
+			log.Error("That Lobby wasn't found. Please check spelling, or run \"list\" to see all lobbies")
+		} else {
+			log.WithFields(log.Fields{
+				"host": client.lastCheckin.Lobbies[foundLobby].Host,
+				"name": client.lastCheckin.Lobbies[foundLobby].Name,
+			}).Info("OK, linking to lobby.")
+
+		}
+
+		client.mutex.Unlock()
+		client.link(foundLobby)
+
+		// TODO: TCP Tunnel game data
+	}
 }
