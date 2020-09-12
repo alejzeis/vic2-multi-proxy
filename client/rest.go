@@ -254,3 +254,58 @@ func (r *restClient) unlink() bool {
 
 	return true
 }
+
+func (r *restClient) host(lobbyName string, password string) bool {
+	if !r.checkConnected() {
+		return false
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	url := r.serverURL + "/host/" + r.authToken
+	response, err := r.rest.R().SetFormData(map[string]string{
+		"name":     lobbyName,
+		"password": password,
+	}).Put(url)
+	if err != nil || response.StatusCode() != http.StatusNoContent {
+		log.WithFields(log.Fields{
+			"url":    url,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
+		}).WithError(err).Error("Failed to create lobby")
+		return false
+	}
+
+	log.Info("Successfully created lobby and now hosting")
+
+	r.lastCheckin.Hosting = true
+
+	return true
+}
+
+func (r *restClient) stopHost() bool {
+	if !r.checkConnected() {
+		return false
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	url := r.serverURL + "/host/" + r.authToken
+	response, err := r.rest.R().Delete(url)
+	if err != nil || response.StatusCode() != http.StatusNoContent {
+		log.WithFields(log.Fields{
+			"url":    url,
+			"status": response.StatusCode(),
+			"body":   response.Body(),
+		}).WithError(err).Error("Failed to delete lobby")
+		return false
+	}
+
+	log.Info("Successfully deleted lobby and stopped hosting")
+
+	r.lastCheckin.Hosting = false
+
+	return true
+}

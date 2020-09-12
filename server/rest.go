@@ -389,7 +389,13 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.ParseForm()
+	err := r.ParseForm()
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"username": user.Username,
+			"address":  r.RemoteAddr,
+		}).Warning("Failed to parse form for /host API endpoint")
+	}
 	if r.FormValue("name") == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -411,6 +417,8 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 		"username": user.Username,
 		"lobby":    r.FormValue("name"),
 	}).Info("New lobby created")
+
+	// TODO: Notify TCP Tunnel Proxy here
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -457,6 +465,8 @@ func handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
 		"username": user.Username,
 		"lobby":    name,
 	}).Info("Lobby deleted")
+
+	// TODO: Notify TCP Tunnel Proxy here
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -506,6 +516,8 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 			"username": user.Username,
 			"lobby":    oldLobby,
 		}).Info("Unlinked from lobby")
+
+		// TODO: Notify TCP Tunnel Proxy here
 		return
 	}
 
@@ -536,6 +548,8 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 		"username": user.Username,
 		"lobby":    user.Linkedto,
 	}).Info("Linked to lobby")
+
+	// TODO: Notify TCP Tunnel Proxy here
 
 	w.WriteHeader(http.StatusNoContent)
 }

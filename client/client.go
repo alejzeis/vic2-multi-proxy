@@ -59,6 +59,17 @@ func RunClient() {
 					client.unlink()
 					// TODO Stop TCP tunnel of data
 				}
+			} else if strings.HasPrefix(text, "host") {
+				if !client.checkConnected() {
+					log.Error("You must be connected to a server first in order to host.")
+				} else {
+					exploded := strings.Split(text, " ")
+					if len(exploded) > 1 {
+						processHostCommand(client, scanner, exploded[1])
+					} else {
+						log.Error("Usage: \"host [start/stop]")
+					}
+				}
 			} else {
 				log.Warn("Unknown Command")
 			}
@@ -100,7 +111,7 @@ func processLinkCommand(client *restClient, lobbyName string) {
 			}
 		}
 
-		if foundLobby != "" {
+		if foundLobby == "" {
 			log.Error("That Lobby wasn't found. Please check spelling, or run \"list\" to see all lobbies")
 		} else {
 			log.WithFields(log.Fields{
@@ -114,5 +125,42 @@ func processLinkCommand(client *restClient, lobbyName string) {
 		client.link(foundLobby)
 
 		// TODO: TCP Tunnel game data
+	}
+}
+
+func processHostCommand(client *restClient, scanner *bufio.Scanner, operation string) {
+	client.mutex.Lock()
+
+	switch operation {
+	case "start":
+		if client.lastCheckin.Hosting {
+			log.Error("You are already hosting a lobby!")
+			break
+		}
+
+		fmt.Print("Enter the name for your lobby: ")
+		scanner.Scan()
+		lobbyName := scanner.Text()
+
+		fmt.Print("\nEnter a password for the lobby (or leave blank): ")
+		scanner.Scan()
+		password := scanner.Text()
+
+		client.mutex.Unlock()
+		if client.host(lobbyName, password) {
+			// TODO: Begin TCP Tunnel
+		}
+		break
+	case "stop":
+		if !client.lastCheckin.Hosting {
+			log.Error("You aren't hosting a lobby.")
+			break
+		}
+
+		client.mutex.Unlock()
+		if client.stopHost() {
+			// TODO: Stop TCP Tunnel
+		}
+		break
 	}
 }
