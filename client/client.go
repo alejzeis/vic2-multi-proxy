@@ -14,6 +14,7 @@ func RunClient() {
 	log.Info("Client ready for commands.")
 	scanner := bufio.NewScanner(os.Stdin)
 	client := createRestClient("")
+	proxy := createProxyClient()
 
 	for {
 		fmt.Print("> ")
@@ -48,7 +49,7 @@ func RunClient() {
 				// link [name]
 				exploded := strings.Split(text, " ")
 				if len(exploded) > 1 {
-					processLinkCommand(client, exploded[1])
+					processLinkCommand(client, proxy, exploded[1])
 				} else {
 					log.Error("Usage: \"link [lobby Name]\"")
 				}
@@ -57,7 +58,7 @@ func RunClient() {
 					log.Error("You must be connected to a server and linked to lobby first.")
 				} else {
 					client.unlink()
-					// TODO Stop TCP tunnel of data
+					proxy.setForwarding(false)
 				}
 			} else if strings.HasPrefix(text, "host") {
 				if !client.checkConnected() {
@@ -97,7 +98,7 @@ func processListCommand(client *restClient) {
 	}
 }
 
-func processLinkCommand(client *restClient, lobbyName string) {
+func processLinkCommand(client *restClient, proxy *proxyClient, lobbyName string) {
 	client.mutex.Lock()
 
 	if !client.checkConnectedNoLock() {
@@ -124,7 +125,7 @@ func processLinkCommand(client *restClient, lobbyName string) {
 		client.mutex.Unlock()
 		client.link(foundLobby)
 
-		// TODO: TCP Tunnel game data
+		proxy.setForwarding(true)
 	}
 }
 
@@ -148,7 +149,7 @@ func processHostCommand(client *restClient, scanner *bufio.Scanner, operation st
 
 		client.mutex.Unlock()
 		if client.host(lobbyName, password) {
-			// TODO: Begin TCP Tunnel
+			// TODO: Start relaying data
 		}
 		break
 	case "stop":
@@ -159,8 +160,12 @@ func processHostCommand(client *restClient, scanner *bufio.Scanner, operation st
 
 		client.mutex.Unlock()
 		if client.stopHost() {
-			// TODO: Stop TCP Tunnel
+			// TODO: Stop relaying data
 		}
+		break
+	default:
+		log.Error("Usage: host [start/stop]")
+		client.mutex.Unlock()
 		break
 	}
 }

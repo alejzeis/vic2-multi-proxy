@@ -126,12 +126,19 @@ func (r *restClient) checkin() {
 		return
 	}
 
+	linkedToLobbyPrior := r.lastCheckin.LinkedLobby > 0
+
 	decodeErr := json.Unmarshal(response.Body(), &r.lastCheckin)
 	if decodeErr != nil {
 		log.WithFields(log.Fields{
 			"url":  url,
 			"body": response.String(),
 		}).WithError(err).Error("Failed to decode JSON response while processing checkin.")
+	}
+
+	if linkedToLobbyPrior && r.lastCheckin.LinkedLobby == 0 {
+		log.Error("Remote Lobby closed.")
+		// TODO: Stop TCP Tunnel
 	}
 }
 
