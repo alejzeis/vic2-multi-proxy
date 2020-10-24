@@ -33,6 +33,7 @@ func RunClient() {
 						log.WithField("url", exploded[1]).Info("Connecting to server...")
 						client.serverURL = exploded[1]
 						client.connect(exploded[2])
+						proxy.onConnectMatchmaking(strings.ReplaceAll(exploded[2], "http://", ""))
 					} else {
 						log.Error("Usage: \"connect [URL] [username]\"")
 					}
@@ -42,6 +43,7 @@ func RunClient() {
 					log.Error("Not connected to a server, use \"connect\" command first")
 				} else {
 					client.disconnect()
+					proxy.onDisconnectMatchmaking()
 				}
 			} else if strings.HasPrefix(text, "list") {
 				processListCommand(client)

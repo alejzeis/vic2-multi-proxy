@@ -141,6 +141,31 @@ func (client *proxyClient) listenIncoming() {
 	}
 }
 
+func (client *proxyClient) onConnectMatchmaking(address string) {
+	client.serverAddress = address + ":16322"
+	tcpAddr, err := net.ResolveTCPAddr("tcp", client.serverAddress)
+	if err != nil {
+		log.WithError(err).WithField("address", address).Error("Failed to resolve remote server address for proxying!")
+		panic(err)
+	}
+
+	conn, err := net.DialTCP("tcp", nil, tcpAddr)
+	if err != nil {
+		log.WithError(err).WithField("address", address).Error("Failed to connect to remote server address for proxying!")
+		panic(err)
+	}
+
+	client.remoteConnection = conn
+	_ = client.remoteConnection.SetKeepAlive(true)
+}
+
+func (client *proxyClient) onDisconnectMatchmaking() {
+	err := client.remoteConnection.Close()
+	if err != nil {
+		log.WithError(err).WithField("address", client.serverAddress).Error("Failed to close connected to remote server for proxying.")
+	}
+}
+
 func (client *proxyClient) setForwarding(forwarding bool) {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
