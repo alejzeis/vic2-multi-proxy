@@ -6,27 +6,24 @@ import (
 )
 
 type GameDataContainer struct {
-	Relay  bool
-	Origin uint16
-	Data   []byte
+	// True if going from client -> server, false if server -> client
+	ToServer bool
+	Data     []byte
 }
 
 func (container *GameDataContainer) Encode() []byte {
 	buf := bytes.Buffer{}
-	buf.Grow(7 + len(container.Data))
+	buf.Grow(5 + len(container.Data))
 
 	lengthBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lengthBuf, uint32(len(container.Data)+3))
+	binary.LittleEndian.PutUint32(lengthBuf, uint32(len(container.Data)+1))
 	buf.Write(lengthBuf)
 
-	if container.Relay {
+	if container.ToServer {
 		buf.WriteByte(1)
 	} else {
 		buf.WriteByte(0)
 	}
-	originBuf := make([]byte, 2)
-	binary.LittleEndian.PutUint16(originBuf, container.Origin)
-	buf.Write(originBuf)
 
 	buf.Write(container.Data)
 

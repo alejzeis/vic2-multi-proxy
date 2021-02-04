@@ -5,38 +5,28 @@ import (
 	log "github.com/sirupsen/logrus"
 	"net"
 	"sync"
-	"time"
 )
 
 func processLocalData(client *proxyClient) {
+	log.Info("Started listening for local game data")
 	for {
-		client.mutex.Lock()
-		if !client.forwarding {
-			time.Sleep(time.Second)
-		}
-		client.mutex.Unlock()
-
 		buf := make([]byte, 2048)
-		length, err := client.localConnection.Read(buf)
+		length, err := client.localListener.Read(buf)
 		if err != nil {
-			log.WithField("addr", client.localConnection.RemoteAddr().String()).WithError(err).Warn("Error while reading buffer from local game instance connection.")
-
-			client.mutex.Lock()
-			client.localListener = nil
-			client.mutex.Unlock()
+			log.WithField("addr", client.localListener.RemoteAddr().String()).WithError(err).Error("Error while reading data from local listening socket")
 			break
 		}
 
 		container := common.GameDataContainer{
-			Relay:  false,
-			Origin: uint16(client.localConnection.RemoteAddr().(*net.TCPAddr).Port),
-			Data:   buf[0 : length-1],
+			ToServer: true,
+			Data:     buf[0 : length-1],
 		}
 		_, err = client.remoteConnection.Write(container.Encode())
 		if err != nil {
 			log.WithError(err).Warn("Failed to send Local Game Data to Proxy Server")
 		}
 	}
+	log.Info("Stopped listening for local game data")
 }
 
 type proxyClient struct {
@@ -47,8 +37,7 @@ type proxyClient struct {
 
 	connected bool
 
-	localListener   *net.TCPListener
-	localConnection *net.TCPConn
+	localListener *net.UDPConn
 
 	forwarding bool
 	running    bool
@@ -70,12 +59,13 @@ func (client *proxyClient) startup() {
 
 	client.running = true
 	addr := "127.0.0.1:1630"
-	loopbackAddr, err := net.ResolveTCPAddr("tcp", addr)
+	loopbackAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
+		log.WithError(err).WithField("addr", addr).Error("Failed to resolve loopback address")
 		panic(err)
 	}
 
-	listener, err2 := net.ListenTCP("tcp", loopbackAddr)
+	listener, err2 := net.ListenUDP("tcp", loopbackAddr)
 	if err2 != nil {
 		log.WithError(err2).WithField("addr", addr).Error("Failed to start listening locally")
 		panic(err2)
@@ -83,7 +73,7 @@ func (client *proxyClient) startup() {
 	client.localListener = listener
 	log.WithField("addr", addr).Info("Started listening locally")
 
-	go client.listenIncoming()
+	go processLocalData(client)
 }
 
 func (client *proxyClient) shutdown() {
@@ -96,48 +86,12 @@ func (client *proxyClient) shutdown() {
 			log.WithError(err).Error("Failed to close remote connection while shutting down proxy client.")
 		}
 	}
-	if client.forwarding && client.localConnection != nil {
-		err := client.localConnection.Close()
-		if err != nil {
-			log.WithError(err).Error("Failed to close local connection while shutting down proxy client.")
-		}
-	}
 
 	client.running = false
 	client.forwarding = false
 	err := client.localListener.Close()
 	if err != nil {
 		log.WithError(err).Error("Failed to close local listener while shutting down proxy client.")
-	}
-}
-
-func (client *proxyClient) listenIncoming() {
-	for {
-		client.mutex.Lock()
-		if !client.running {
-			break
-		}
-		client.mutex.Unlock()
-
-		conn, err := client.localListener.AcceptTCP()
-		if err != nil {
-			log.WithError(err).Error("Failed to accept TCP connection on local listener.")
-			continue
-		}
-
-		if client.localConnection != nil {
-			log.WithField("addr", conn.RemoteAddr().String()).Warn("Closed connection, there is already an active connection from a local game instance.")
-			conn.Close()
-			continue
-		}
-
-		err2 := conn.SetKeepAlive(true)
-		if err2 != nil {
-			log.WithError(err).Error("Failed to set keepalive for local game connection.")
-		}
-		client.localConnection = conn
-		go processLocalData(client)
-		log.WithField("addr", conn.RemoteAddr().String()).Debug("Accepted local game instance connection")
 	}
 }
 
