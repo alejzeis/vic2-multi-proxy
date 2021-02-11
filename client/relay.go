@@ -35,20 +35,26 @@ type gameRelay struct {
 	serverAddress    string
 	remoteConnection *websocket.Conn
 
-	localSocket *net.UDPConn
+	localProxies map[uint64]*virtualGameProxy
 
-	localSignalChannel  chan channelSignal
 	remoteSignalChannel chan channelSignal
 }
 
-func (relay *gameRelay) shutdown() {
-	relay.localSignalChannel <- SHUTDOWN
-	relay.remoteSignalChannel <- SHUTDOWN
+// Represents a "proxied" game connected to the local actual game
+// This is either one of various clients (if the local game is hosting)
+// Or a virtual "server" (if the local game is linked to a remote lobby)
+type virtualGameProxy struct {
+	identifier uint64
+	socket     *net.UDPConn
 
-	err := relay.localSocket.Close()
-	if err != nil {
-		log.WithError(err).Warn("Failed to properly close local game data socket")
+	signalChannel chan channelSignal
+}
+
+func (relay *gameRelay) shutdown() {
+	for _, proxy := range relay.localProxies {
+		proxy.signalChannel <- SHUTDOWN
 	}
+	relay.remoteSignalChannel <- SHUTDOWN
 
 	// Await on their threads to exit (should send a message telling us shutdown complete
 	<-relay.localSignalChannel
@@ -56,6 +62,7 @@ func (relay *gameRelay) shutdown() {
 }
 
 // TODO: Need to make this spawnable per-socket for when hosting a lobby
+// Make this part of virtualGameProxy
 // When hosting, each fake "client" will have their own UDP socket and thread instance of this
 func (relay *gameRelay) relayDataLocalToRemote() {
 	relay.mutex.Lock()
@@ -91,8 +98,8 @@ func (relay *gameRelay) relayDataLocalToRemote() {
 		case signal := <-relay.localSignalChannel:
 			switch signal {
 			case SHUTDOWN:
-				relay.localSignalChannel <- SHUTDOWN
-				return // Exit function, stopping the thread
+				relay.localSignalChannel <- SHUTDOWN // Re-send signal so the shutdown function knows we are terminated
+				return                               // Exit function, stopping the thread
 			case WEBSOCKET_READY:
 				wsReady = true
 			case DISCONNECTED_MATCHMAKING:
@@ -136,8 +143,8 @@ func (relay *gameRelay) relayDataRemoteToLocal() {
 			case DISCONNECTED_MATCHMAKING:
 				return // Exit function, stopping the thread
 			case SHUTDOWN:
-				relay.remoteSignalChannel <- SHUTDOWN
-				return // Exit function, stopping the thread
+				relay.remoteSignalChannel <- SHUTDOWN // Re-send signal so the shutdown function knows we are terminated
+				return                                // Exit function, stopping the thread
 			case STOP_FORWARDING:
 				forwarding = false
 			case BEGIN_FORWARDING:
@@ -151,7 +158,12 @@ func (relay *gameRelay) relayDataRemoteToLocal() {
 
 		msgType, data, err := relay.remoteConnection.ReadMessage()
 		if err != nil {
-			log.WithError(err).Warn("Failed to read message from remote websocket connection")
+			if websocket.IsCloseError(err) {
+				log.WithError(err).Warn("Remote websocket connection closed by server")
+				relay.onDisconnectedFromServer()
+			} else {
+				log.WithError(err).Warn("Failed to read message from remote websocket connection")
+			}
 		} else if msgType == websocket.BinaryMessage && forwarding {
 			// TODO: Send data to game address
 			container := common.DecodeGameDataContainer(data)

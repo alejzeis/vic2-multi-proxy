@@ -33,7 +33,7 @@ func RunClient() {
 						log.WithField("url", exploded[1]).Info("Connecting to server...")
 						client.serverURL = exploded[1]
 						if client.connect(exploded[2]) {
-							if !relay.onConnectedToServer(exploded[1]) {
+							if !relay.onConnectedToServer(exploded[1], client.authToken) {
 								// Failed to connect on websocket, so logout from REST api
 								client.disconnect()
 							}
