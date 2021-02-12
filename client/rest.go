@@ -45,14 +45,17 @@ type restClient struct {
 	authToken     string
 	lastRenewedAt time.Time
 	mutex         *sync.Mutex
+
+	relay *gameRelay
 }
 
-func createRestClient(serverURL string) *restClient {
+func createRestClient(serverURL string, relay *gameRelay) *restClient {
 	client := new(restClient)
 	client.stop = true
 	client.serverURL = serverURL
 	client.rest = resty.New()
-	client.mutex = &sync.Mutex{}
+	client.mutex = new(sync.Mutex)
+	client.relay = relay
 	return client
 }
 
@@ -95,19 +98,17 @@ func (r *restClient) renewToken() {
 	response, err := r.rest.R().Get(url)
 	if err != nil {
 		log.WithField("url", url).WithError(err).Warn("Failed to renew token.")
-		return
 	} else if response.StatusCode() != http.StatusOK {
 		log.WithFields(log.Fields{
 			"url":    url,
 			"status": response.StatusCode(),
 			"body":   response.Body(),
 		}).Warn("Failed to renew token")
-		return
+	} else {
+		log.Debug("Renewed token")
+		r.authToken = response.String()
+		r.lastRenewedAt = time.Now()
 	}
-
-	log.Debug("Renewed token")
-	r.authToken = response.String()
-	r.lastRenewedAt = time.Now()
 }
 
 // not thread safe, lock the mutex before calling this
@@ -116,29 +117,27 @@ func (r *restClient) checkin() {
 	response, err := r.rest.R().Get(url)
 	if err != nil {
 		log.WithField("url", url).WithError(err).Warn("Failed to process checkin.")
-		return
 	} else if response.StatusCode() != http.StatusOK {
 		log.WithFields(log.Fields{
 			"url":    url,
 			"status": response.StatusCode(),
 			"body":   response.Body(),
 		}).Warn("Failed to process checkin")
-		return
-	}
+	} else {
+		linkedToLobbyPrior := r.lastCheckin.LinkedLobby > 0
 
-	linkedToLobbyPrior := r.lastCheckin.LinkedLobby > 0
+		decodeErr := json.Unmarshal(response.Body(), &r.lastCheckin)
+		if decodeErr != nil {
+			log.WithFields(log.Fields{
+				"url":  url,
+				"body": response.String(),
+			}).WithError(err).Error("Failed to decode JSON response while processing checkin.")
+		}
 
-	decodeErr := json.Unmarshal(response.Body(), &r.lastCheckin)
-	if decodeErr != nil {
-		log.WithFields(log.Fields{
-			"url":  url,
-			"body": response.String(),
-		}).WithError(err).Error("Failed to decode JSON response while processing checkin.")
-	}
-
-	if linkedToLobbyPrior && r.lastCheckin.LinkedLobby == 0 {
-		log.Error("Remote Lobby closed.")
-		// TODO: Stop TCP Tunnel
+		if linkedToLobbyPrior && r.lastCheckin.LinkedLobby == 0 {
+			log.Error("Remote Lobby closed.")
+			r.relay.onStopLinked()
+		}
 	}
 }
 
@@ -166,16 +165,16 @@ func (r *restClient) connect(username string) bool {
 			"body":   response.Body(),
 		}).Error("Failed to login")
 		return false
+	} else {
+		log.Info("Successfully logged into server.")
+		r.stop = false
+		r.authToken = response.String()
+		r.lastRenewedAt = time.Now()
+
+		go continuousCheckin(r)
+
+		return true
 	}
-
-	log.Info("Successfully logged into server.")
-	r.stop = false
-	r.authToken = response.String()
-	r.lastRenewedAt = time.Now()
-
-	go continuousCheckin(r)
-
-	return true
 }
 
 func (r *restClient) disconnect() {
@@ -190,19 +189,17 @@ func (r *restClient) disconnect() {
 	response, err := r.rest.R().Get(url)
 	if err != nil {
 		log.WithField("url", url).WithError(err).Error("Failed to logout")
-		return
 	} else if response.StatusCode() != http.StatusNoContent {
 		log.WithFields(log.Fields{
 			"url":    url,
 			"status": response.StatusCode(),
 			"body":   response.Body(),
 		}).Error("Failed to logout")
-		return
+	} else {
+		log.Info("Successfully logged out of server.")
+		r.stop = true
+		r.authToken = ""
 	}
-
-	log.Info("Successfully logged out of server.")
-	r.stop = true
-	r.authToken = ""
 }
 
 func (r *restClient) link(lobbyIdStr string) bool {
@@ -223,17 +220,17 @@ func (r *restClient) link(lobbyIdStr string) bool {
 			"lobbyId": lobbyIdStr,
 		}).WithError(err).Error("Failed to link to lobby")
 		return false
+	} else {
+		log.WithFields(log.Fields{
+			"id":   lobbyIdStr,
+			"name": r.lastCheckin.Lobbies[lobbyIdStr].Name,
+		}).Info("Successfully linked to lobby ")
+
+		lobbyId, _ := strconv.Atoi(lobbyIdStr)
+		r.lastCheckin.LinkedLobby = uint64(lobbyId)
+
+		return true
 	}
-
-	log.WithFields(log.Fields{
-		"id":   lobbyIdStr,
-		"name": r.lastCheckin.Lobbies[lobbyIdStr].Name,
-	}).Info("Successfully linked to lobby ")
-
-	lobbyId, _ := strconv.Atoi(lobbyIdStr)
-	r.lastCheckin.LinkedLobby = uint64(lobbyId)
-
-	return true
 }
 
 func (r *restClient) unlink() bool {
@@ -253,13 +250,13 @@ func (r *restClient) unlink() bool {
 			"body":   response.Body(),
 		}).WithError(err).Error("Failed to unlink")
 		return false
+	} else {
+		log.Info("Successfully unlinked from lobby")
+
+		r.lastCheckin.LinkedLobby = 0
+
+		return true
 	}
-
-	log.Info("Successfully unlinked from lobby")
-
-	r.lastCheckin.LinkedLobby = 0
-
-	return true
 }
 
 func (r *restClient) host(lobbyName string, password string) bool {
@@ -282,13 +279,13 @@ func (r *restClient) host(lobbyName string, password string) bool {
 			"body":   response.Body(),
 		}).WithError(err).Error("Failed to create lobby")
 		return false
+	} else {
+		log.Info("Successfully created lobby and now hosting")
+
+		r.lastCheckin.Hosting = true
+
+		return true
 	}
-
-	log.Info("Successfully created lobby and now hosting")
-
-	r.lastCheckin.Hosting = true
-
-	return true
 }
 
 func (r *restClient) stopHost() bool {
@@ -308,11 +305,11 @@ func (r *restClient) stopHost() bool {
 			"body":   response.Body(),
 		}).WithError(err).Error("Failed to delete lobby")
 		return false
+	} else {
+		log.Info("Successfully deleted lobby and stopped hosting")
+
+		r.lastCheckin.Hosting = false
+
+		return true
 	}
-
-	log.Info("Successfully deleted lobby and stopped hosting")
-
-	r.lastCheckin.Hosting = false
-
-	return true
 }

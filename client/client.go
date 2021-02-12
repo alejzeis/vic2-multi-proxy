@@ -13,8 +13,8 @@ import (
 func RunClient() {
 	log.Info("Client ready for commands.")
 	scanner := bufio.NewScanner(os.Stdin)
-	client := createRestClient("")
 	relay := createStartRelay()
+	client := createRestClient("", relay)
 
 	for {
 		fmt.Print("> ")
@@ -117,18 +117,17 @@ func processLinkCommand(client *restClient, relay *gameRelay, lobbyName string) 
 
 	if foundLobby == "" {
 		log.Error("That Lobby wasn't found. Please check spelling, or run \"list\" to see all lobbies")
-		return
+		client.mutex.Unlock()
 	} else {
 		log.WithFields(log.Fields{
 			"host": client.lastCheckin.Lobbies[foundLobby].Host,
 			"name": client.lastCheckin.Lobbies[foundLobby].Name,
 		}).Info("OK, linking to lobby.")
 
+		client.mutex.Unlock()
+		client.link(foundLobby)
+		relay.onBeginLinked() // Tell relay to start emulating the hosted game on localhost
 	}
-
-	client.mutex.Unlock()
-	client.link(foundLobby)
-	relay.onBeginLinked() // Tell relay to start emulating the hosted game on localhost
 }
 
 func processHostCommand(client *restClient, relay *gameRelay, scanner *bufio.Scanner, operation string) {
@@ -139,30 +138,29 @@ func processHostCommand(client *restClient, relay *gameRelay, scanner *bufio.Sca
 		if client.lastCheckin.Hosting {
 			log.Error("You are already hosting a lobby!")
 			break
-		}
+		} else {
+			fmt.Print("Enter the name for your lobby: ")
+			scanner.Scan()
+			lobbyName := scanner.Text()
 
-		fmt.Print("Enter the name for your lobby: ")
-		scanner.Scan()
-		lobbyName := scanner.Text()
+			fmt.Print("\nEnter a password for the lobby (or leave blank): ")
+			scanner.Scan()
+			password := scanner.Text()
 
-		fmt.Print("\nEnter a password for the lobby (or leave blank): ")
-		scanner.Scan()
-		password := scanner.Text()
-
-		client.mutex.Unlock()
-		if client.host(lobbyName, password) {
-			relay.onBeginHosting() // Tell relay to start emulating game clients to the local hosted game
+			client.mutex.Unlock()
+			if client.host(lobbyName, password) {
+				relay.onBeginHosting() // Tell relay to start emulating game clients to the local hosted game
+			}
 		}
 		break
 	case "stop":
 		if !client.lastCheckin.Hosting {
 			log.Error("You aren't hosting a lobby.")
-			break
-		}
-
-		client.mutex.Unlock()
-		if client.stopHost() {
-			relay.onStopHosting() // Tell relay to stop emulating game clients to the local hosted game
+		} else {
+			client.mutex.Unlock()
+			if client.stopHost() {
+				relay.onStopHosting() // Tell relay to stop emulating game clients to the local hosted game
+			}
 		}
 		break
 	default:

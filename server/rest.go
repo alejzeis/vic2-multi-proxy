@@ -325,7 +325,7 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 
 	lobbyMap := make(map[string]common.RestLobby)
 	for _, val := range matchmaker.lobbies {
-		lobbyMap[strconv.FormatUint(val.ID, 10)] = common.RestLobby{val.Name, val.HostUsername}
+		lobbyMap[strconv.FormatUint(val.ID, 10)] = common.RestLobby{Name: val.Name, Host: val.HostUsername}
 	}
 
 	var isHosting bool
