@@ -9,7 +9,7 @@ const DefaultVic2GamePort uint16 = 1930
 
 func DecodeGameDataContainer(data []byte) GameDataContainer {
 	return GameDataContainer{
-		Identifier: binary.LittleEndian.Uint64(data[0:8]),
+		Identifier: binary.BigEndian.Uint64(data[0:8]),
 		Data:       data[8:(len(data) - 1)],
 	}
 }
@@ -25,7 +25,7 @@ func (container *GameDataContainer) Encode() []byte {
 	buf.Grow(8 + len(container.Data))
 
 	identBuf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(identBuf, container.Identifier)
+	binary.BigEndian.PutUint64(identBuf, container.Identifier)
 	buf.Write(identBuf)
 
 	buf.Write(container.Data)

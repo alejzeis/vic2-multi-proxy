@@ -46,10 +46,10 @@ type restClient struct {
 	lastRenewedAt time.Time
 	mutex         *sync.Mutex
 
-	relay *gameRelay
+	relay gameRelay
 }
 
-func createRestClient(serverURL string, relay *gameRelay) *restClient {
+func createRestClient(serverURL string, relay gameRelay) *restClient {
 	client := new(restClient)
 	client.stop = true
 	client.serverURL = serverURL

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"github.com/alejzeis/vic2-multi-proxy/common"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
@@ -10,8 +11,8 @@ import (
 	"sync"
 )
 
-func createStartRelay() *gameRelay {
-	relay := new(gameRelay)
+func createStartRelay() *gameRelayImpl {
+	relay := new(gameRelayImpl)
 	relay.mutex = new(sync.Mutex)
 	relay.localProxies = make(map[uint64]*virtualGameProxy)
 	relay.remoteSignalChannel = make(chan channelSignal)
@@ -29,7 +30,19 @@ const (
 	STOP_FORWARDING
 )
 
-type gameRelay struct {
+type gameRelay interface {
+	shutdown()
+	sendContainerToServer(container common.GameDataContainer)
+	relayDataRemoteToLocal()
+	onConnectedToServer(address string, auth string) bool
+	onDisconnectedFromServer()
+	onBeginHosting()
+	onStopHosting()
+	onBeginLinked()
+	onStopLinked()
+}
+
+type gameRelayImpl struct {
 	mutex            *sync.Mutex
 	serverAddress    string
 	remoteConnection *websocket.Conn
@@ -43,16 +56,16 @@ type gameRelay struct {
 // This is either one of various clients (if the local game is hosting)
 // Or a virtual "server" (if the local game is linked to a remote lobby)
 type virtualGameProxy struct {
-	identifier uint64
-	socket     *net.UDPConn
+	identifier  uint64
+	socket      *net.UDPConn
+	gameAddress *net.UDPAddr
 
-	relay *gameRelay
+	relay gameRelay
 
 	signalChannel chan channelSignal
 }
 
-// When hosting, each fake "client" will have their own UDP socket and thread instance of this
-func (proxy *virtualGameProxy) relayDataLocalToRemote(port uint16) {
+func (proxy *virtualGameProxy) initSocket(port uint16) {
 	bindAddr := "127.0.0.1:" + strconv.Itoa(int(port))
 	loopbackAddr, err := net.ResolveUDPAddr("udp", bindAddr)
 	if err != nil {
@@ -70,33 +83,45 @@ func (proxy *virtualGameProxy) relayDataLocalToRemote(port uint16) {
 	log.WithFields(log.Fields{
 		"address":         bindAddr,
 		"proxyIdentifier": proxy.identifier,
-	}).Debug("Started listening for local game data")
+	}).Debug("Created socket for relaying local game data")
+}
 
+// When hosting, each fake "client" will have their own UDP socket and thread instance of this
+func (proxy *virtualGameProxy) relayDataLocalToRemote(hosting bool) {
 	defer func() {
 		err := proxy.socket.Close()
 		if err != nil {
 			log.WithError(err).WithFields(log.Fields{
 				"identifier":   proxy.identifier,
-				"localAddress": bindAddr,
+				"localAddress": proxy.socket.LocalAddr().String(),
 			}).Error("Failed to close local UDP socket for virtualGameProxy.")
 		}
 
-		log.WithFields(log.Fields{
-			"address":         bindAddr,
-			"proxyIdentifier": proxy.identifier,
-		}).Debug("Stopped listening for local game data")
+		log.WithField("proxyIdentifier", proxy.identifier).Debug("Stopped listening for local game data")
 		proxy.signalChannel <- SHUTDOWN // Re-send signal so the shutdown function knows we are terminated
 	}()
+
+	if hosting {
+		gameAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1630")
+		if err != nil {
+			log.WithError(err).WithField("address", "127.0.0.1:1630").Error("Failed to resolve game address")
+		} else {
+			proxy.gameAddress = gameAddr
+		}
+	}
 
 	for {
 		buf := make([]byte, 2048)
 		length, address, err := proxy.socket.ReadFromUDP(buf)
 		if err != nil {
 			log.WithError(err).WithFields(log.Fields{
-				"localAddress":    bindAddr,
+				"localAddress":    proxy.socket.LocalAddr().String(),
 				"remoteAddress":   address,
 				"proxyIdentifier": proxy.identifier,
 			}).Warn("Error while reading data from local listening socket")
+		} else if proxy.gameAddress == nil {
+			// TODO: Maybe parse packet to ensure it's a real packet from the game?
+			proxy.gameAddress = address
 		}
 
 		select {
@@ -114,24 +139,35 @@ func (proxy *virtualGameProxy) relayDataLocalToRemote(port uint16) {
 			Data:       buf[0:(length - 1)],
 		}
 
-		err = proxy.relay.remoteConnection.WriteMessage(websocket.BinaryMessage, container.Encode())
+		proxy.relay.sendContainerToServer(container)
+	}
+}
+
+func (proxy *virtualGameProxy) sendGamePacket(container common.GameDataContainer) error {
+	if proxy.gameAddress == nil {
+		return errors.New("game Address hasn't been obtained yet")
+	} else {
+		_, err := proxy.socket.WriteToUDP(container.Encode(), proxy.gameAddress)
 		if err != nil {
-			log.WithFields(log.Fields{
-				"gameAddr":        address.String(),
-				"relayAddr":       proxy.relay.serverAddress,
-				"proxyIdentifier": proxy.identifier,
-				"localAddress":    bindAddr,
-				"length":          length,
-			}).WithError(err).Warn("Failed to relay a packet from local game to relay server")
+			return err
+		} else {
+			return nil
 		}
 	}
 }
 
-func (proxy *virtualGameProxy) sendGamePacket(container common.GameDataContainer) {
-	// TODO: send container data to local game instance
+func (relay *gameRelayImpl) sendContainerToServer(container common.GameDataContainer) {
+	err := relay.remoteConnection.WriteMessage(websocket.BinaryMessage, container.Encode())
+	if err != nil {
+		log.WithFields(log.Fields{
+			"relayAddr":       relay.serverAddress,
+			"proxyIdentifier": container.Identifier,
+			"length":          len(container.Data),
+		}).WithError(err).Warn("Failed to relay a packet from local game to relay server")
+	}
 }
 
-func (relay *gameRelay) shutdown() {
+func (relay *gameRelayImpl) shutdown() {
 	for _, proxy := range relay.localProxies {
 		proxy.signalChannel <- SHUTDOWN
 	}
@@ -146,7 +182,7 @@ func (relay *gameRelay) shutdown() {
 	log.Info("All proxy threads exited.")
 }
 
-func (relay *gameRelay) relayDataRemoteToLocal() {
+func (relay *gameRelayImpl) relayDataRemoteToLocal() {
 	forwarding := false
 	hosting := false
 	defer func() {
@@ -194,7 +230,16 @@ func (relay *gameRelay) relayDataRemoteToLocal() {
 
 			proxy, found := relay.localProxies[container.Identifier]
 			if found {
-				proxy.sendGamePacket(container)
+				err = proxy.sendGamePacket(container)
+				if err != nil {
+					log.WithError(err).WithFields(log.Fields{
+						"identifier":   container.Identifier,
+						"length":       len(container.Data),
+						"gameAddress":  proxy.gameAddress,
+						"relayAddress": relay.serverAddress,
+						"hosting":      hosting,
+					}).Warn("Failed to send packet from remote to local game")
+				}
 			} else if hosting {
 				// Proxy instance wasn't found, so it must be a new connection.
 				// Create a new virtualGameProxy to represent this connection
@@ -205,6 +250,8 @@ func (relay *gameRelay) relayDataRemoteToLocal() {
 					signalChannel: make(chan channelSignal),
 				}
 				relay.localProxies[proxy.identifier] = proxy
+				proxy.initSocket(0) // Don't have a specific port to bind to since we are emulating a client
+				go proxy.relayDataLocalToRemote(true)
 			}
 
 			relay.mutex.Unlock()
@@ -212,7 +259,7 @@ func (relay *gameRelay) relayDataRemoteToLocal() {
 	}
 }
 
-func (relay *gameRelay) onConnectedToServer(address string, auth string) bool {
+func (relay *gameRelayImpl) onConnectedToServer(address string, auth string) bool {
 	relay.mutex.Lock()
 	defer relay.mutex.Unlock()
 
@@ -226,6 +273,7 @@ func (relay *gameRelay) onConnectedToServer(address string, auth string) bool {
 		relay.serverAddress = strings.ReplaceAll(address, "https://", "wss://")
 	} else {
 		log.WithField("address", address).Error("Invalid address")
+		return false
 	}
 
 	connection, _, err := websocket.DefaultDialer.Dial(relay.serverAddress, nil)
@@ -245,7 +293,7 @@ func (relay *gameRelay) onConnectedToServer(address string, auth string) bool {
 	return true
 }
 
-func (relay *gameRelay) onDisconnectedFromServer() {
+func (relay *gameRelayImpl) onDisconnectedFromServer() {
 	relay.mutex.Lock()
 	defer relay.mutex.Unlock()
 
@@ -258,7 +306,7 @@ func (relay *gameRelay) onDisconnectedFromServer() {
 	relay.localProxies = make(map[uint64]*virtualGameProxy) // Overwrite the map, we don't need the old proxies anymore
 }
 
-func (relay *gameRelay) onBeginHosting() {
+func (relay *gameRelayImpl) onBeginHosting() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 
@@ -269,7 +317,7 @@ func (relay *gameRelay) onBeginHosting() {
 	}
 }
 
-func (relay *gameRelay) onStopHosting() {
+func (relay *gameRelayImpl) onStopHosting() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 
@@ -282,7 +330,7 @@ func (relay *gameRelay) onStopHosting() {
 	relay.localProxies = make(map[uint64]*virtualGameProxy) // Overwrite the map, we don't need the old proxies anymore
 }
 
-func (relay *gameRelay) onBeginLinked() {
+func (relay *gameRelayImpl) onBeginLinked() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 
@@ -294,13 +342,14 @@ func (relay *gameRelay) onBeginLinked() {
 			signalChannel: make(chan channelSignal),
 		}
 		relay.localProxies[0] = proxy
-		go proxy.relayDataLocalToRemote(common.DefaultVic2GamePort) // We want to open our socket on the Vic2 game port since we are emulating a hosted game
+		proxy.initSocket(common.DefaultVic2GamePort) // We want to open our socket on the Vic2 game port since we are emulating a hosted game
+		go proxy.relayDataLocalToRemote(false)
 
 		relay.remoteSignalChannel <- BEGIN_LINKED_FORWARDING // Start allowing forwarding data from Relay server to the local game instance
 	}
 }
 
-func (relay *gameRelay) onStopLinked() {
+func (relay *gameRelayImpl) onStopLinked() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 

@@ -23,64 +23,68 @@ func RunClient() {
 		text := scanner.Text()
 
 		if len(text) != 0 {
-			if strings.HasPrefix(text, "connect") {
-				if client.checkConnected() {
-					log.Error("Already connected to a server, use \"disconnect\" command first")
-				} else {
-					// connect [server] [username]
-					exploded := strings.Split(text, " ")
-					if len(exploded) > 2 {
-						log.WithField("url", exploded[1]).Info("Connecting to server...")
-						client.serverURL = exploded[1]
-						if client.connect(exploded[2]) {
-							if !relay.onConnectedToServer(exploded[1], client.authToken) {
-								// Failed to connect on websocket, so logout from REST api
-								client.disconnect()
-							}
-						}
-					} else {
-						log.Error("Usage: \"connect [URL] [username]\"")
-					}
-				}
-			} else if strings.HasPrefix(text, "disconnect") {
-				if !client.checkConnected() {
-					log.Error("Not connected to a server, use \"connect\" command first")
-				} else {
-					client.disconnect()
-					relay.onDisconnectedFromServer()
-				}
-			} else if strings.HasPrefix(text, "list") {
-				processListCommand(client)
-			} else if strings.HasPrefix(text, "link") {
-				// link [name]
-				exploded := strings.Split(text, " ")
-				if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
-					log.Error("You must be connected to a server and not already linked to a lobby first.")
-				} else {
-					processLinkCommand(client, relay, exploded[1])
-				}
-			} else if strings.HasPrefix(text, "unlink") {
-				if !client.checkConnected() || client.lastCheckin.LinkedLobby < 1 {
-					log.Error("You must be connected to a server and linked to a lobby first.")
-				} else {
-					client.unlink()
-					relay.onStopLinked() // Tell relay to stop emulating the hosted game on localhost
-				}
-			} else if strings.HasPrefix(text, "host") {
-				if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
-					log.Error("You must be connected to a server first and not already linked to a lobby in order to host.")
-				} else {
-					exploded := strings.Split(text, " ")
-					if len(exploded) > 1 {
-						processHostCommand(client, relay, scanner, exploded[1])
-					} else {
-						log.Error("Usage: \"host [start/stop]")
+			processCommand(text, client, relay, scanner)
+		}
+	}
+}
+
+func processCommand(text string, client *restClient, relay gameRelay, scanner *bufio.Scanner) {
+	if strings.HasPrefix(text, "connect") {
+		if client.checkConnected() {
+			log.Error("Already connected to a server, use \"disconnect\" command first")
+		} else {
+			// connect [server] [username]
+			exploded := strings.Split(text, " ")
+			if len(exploded) > 2 {
+				log.WithField("url", exploded[1]).Info("Connecting to server...")
+				client.serverURL = exploded[1]
+				if client.connect(exploded[2]) {
+					if !relay.onConnectedToServer(exploded[1], client.authToken) {
+						// Failed to connect on websocket, so logout from REST api
+						client.disconnect()
 					}
 				}
 			} else {
-				log.Warn("Unknown Command")
+				log.Error("Usage: \"connect [URL] [username]\"")
 			}
 		}
+	} else if strings.HasPrefix(text, "disconnect") {
+		if !client.checkConnected() {
+			log.Error("Not connected to a server, use \"connect\" command first")
+		} else {
+			client.disconnect()
+			relay.onDisconnectedFromServer()
+		}
+	} else if strings.HasPrefix(text, "list") {
+		processListCommand(client)
+	} else if strings.HasPrefix(text, "link") {
+		// link [name]
+		exploded := strings.Split(text, " ")
+		if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
+			log.Error("You must be connected to a server and not already linked to a lobby first.")
+		} else {
+			processLinkCommand(client, relay, exploded[1])
+		}
+	} else if strings.HasPrefix(text, "unlink") {
+		if !client.checkConnected() || client.lastCheckin.LinkedLobby < 1 {
+			log.Error("You must be connected to a server and linked to a lobby first.")
+		} else {
+			client.unlink()
+			relay.onStopLinked() // Tell relay to stop emulating the hosted game on localhost
+		}
+	} else if strings.HasPrefix(text, "host") {
+		if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
+			log.Error("You must be connected to a server first and not already linked to a lobby in order to host.")
+		} else {
+			exploded := strings.Split(text, " ")
+			if len(exploded) > 1 {
+				processHostCommand(client, relay, scanner, exploded[1])
+			} else {
+				log.Error("Usage: \"host [start/stop]")
+			}
+		}
+	} else {
+		log.Warn("Unknown Command")
 	}
 }
 
@@ -104,7 +108,7 @@ func processListCommand(client *restClient) {
 	}
 }
 
-func processLinkCommand(client *restClient, relay *gameRelay, lobbyName string) {
+func processLinkCommand(client *restClient, relay gameRelay, lobbyName string) {
 	client.mutex.Lock()
 
 	foundLobby := ""
@@ -130,7 +134,7 @@ func processLinkCommand(client *restClient, relay *gameRelay, lobbyName string) 
 	}
 }
 
-func processHostCommand(client *restClient, relay *gameRelay, scanner *bufio.Scanner, operation string) {
+func processHostCommand(client *restClient, relay gameRelay, scanner *bufio.Scanner, operation string) {
 	client.mutex.Lock()
 
 	switch operation {
