@@ -64,7 +64,7 @@ func RunClient() {
 					log.Error("You must be connected to a server and linked to a lobby first.")
 				} else {
 					client.unlink()
-					relay.setForwarding(false)
+					relay.onStopLinked() // Tell relay to stop emulating the hosted game on localhost
 				}
 			} else if strings.HasPrefix(text, "host") {
 				if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
@@ -72,7 +72,7 @@ func RunClient() {
 				} else {
 					exploded := strings.Split(text, " ")
 					if len(exploded) > 1 {
-						processHostCommand(client, scanner, exploded[1])
+						processHostCommand(client, relay, scanner, exploded[1])
 					} else {
 						log.Error("Usage: \"host [start/stop]")
 					}
@@ -128,10 +128,10 @@ func processLinkCommand(client *restClient, relay *gameRelay, lobbyName string) 
 
 	client.mutex.Unlock()
 	client.link(foundLobby)
-	relay.setForwarding(true)
+	relay.onBeginLinked() // Tell relay to start emulating the hosted game on localhost
 }
 
-func processHostCommand(client *restClient, scanner *bufio.Scanner, operation string) {
+func processHostCommand(client *restClient, relay *gameRelay, scanner *bufio.Scanner, operation string) {
 	client.mutex.Lock()
 
 	switch operation {
@@ -151,7 +151,7 @@ func processHostCommand(client *restClient, scanner *bufio.Scanner, operation st
 
 		client.mutex.Unlock()
 		if client.host(lobbyName, password) {
-			// TODO: Start relaying data
+			relay.onBeginHosting() // Tell relay to start emulating game clients to the local hosted game
 		}
 		break
 	case "stop":
@@ -162,7 +162,7 @@ func processHostCommand(client *restClient, scanner *bufio.Scanner, operation st
 
 		client.mutex.Unlock()
 		if client.stopHost() {
-			// TODO: Stop relaying data
+			relay.onStopHosting() // Tell relay to stop emulating game clients to the local hosted game
 		}
 		break
 	default:

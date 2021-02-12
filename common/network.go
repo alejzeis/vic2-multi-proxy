@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 )
 
+const DefaultVic2GamePort uint16 = 1930
+
 func DecodeGameDataContainer(data []byte) GameDataContainer {
 	return GameDataContainer{
 		Identifier: binary.LittleEndian.Uint64(data[0:8]),
