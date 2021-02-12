@@ -15,7 +15,6 @@ func DecodeGameDataContainer(data []byte) GameDataContainer {
 }
 
 type GameDataContainer struct {
-	// TODO: Determine what to make this
 	// An identifier for the origin of this data packet, so the relay on the server or client can know where this came from
 	Identifier uint64
 	Data       []byte
