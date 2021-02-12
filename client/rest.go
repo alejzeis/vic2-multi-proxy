@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jython234/vic2-multi-proxy/common"
+	"github.com/alejzeis/vic2-multi-proxy/common"
 
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"

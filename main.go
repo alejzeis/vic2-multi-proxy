@@ -3,9 +3,9 @@ package main
 import (
 	"os"
 
-	"github.com/jython234/vic2-multi-proxy/client"
-	"github.com/jython234/vic2-multi-proxy/common"
-	"github.com/jython234/vic2-multi-proxy/server"
+	"github.com/alejzeis/vic2-multi-proxy/client"
+	"github.com/alejzeis/vic2-multi-proxy/common"
+	"github.com/alejzeis/vic2-multi-proxy/server"
 
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/ini.v1"

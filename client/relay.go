@@ -1,8 +1,8 @@
 package client
 
 import (
+	"github.com/alejzeis/vic2-multi-proxy/common"
 	"github.com/gorilla/websocket"
-	"github.com/jython234/vic2-multi-proxy/common"
 	log "github.com/sirupsen/logrus"
 	"net"
 	"strconv"

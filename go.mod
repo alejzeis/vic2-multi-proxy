@@ -1,4 +1,4 @@
-module github.com/jython234/vic2-multi-proxy
+module github.com/alejzeis/vic2-multi-proxy
 
 go 1.14
 

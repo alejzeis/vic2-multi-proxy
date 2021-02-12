@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jython234/vic2-multi-proxy/common"
+	"github.com/alejzeis/vic2-multi-proxy/common"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
