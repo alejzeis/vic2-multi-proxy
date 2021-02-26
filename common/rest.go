@@ -7,7 +7,7 @@ const SoftwareName = "vic2-multi-proxy"
 const SoftwareVersion = "v1.0.1-alpha"
 
 // APIVersion is the version of the REST API implemented in this file
-const APIVersion uint = 2
+const APIVersion uint = 3
 
 // InfoResponse is the JSON response to the /info REST method
 type InfoResponse struct {

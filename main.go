@@ -26,6 +26,7 @@ func main() {
 
 		config := loadConfig()
 		matchmaker := new(server.Matchmaker)
+		matchmaker.Init()
 
 		server.StartControlServer(config, matchmaker)
 	} else {

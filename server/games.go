@@ -8,6 +8,7 @@ import (
 
 // User represents a logged in user to the proxy server. Contains info if they are hosting a game or linked to a game or neither
 type User struct {
+	ID          uint64
 	Address     net.Addr
 	Username    string
 	Linkedto    uint64
@@ -28,4 +29,10 @@ type Matchmaker struct {
 	users   map[string]User
 	lobbies map[uint64]Lobby
 	mutex   *sync.Mutex
+}
+
+func (mm *Matchmaker) Init() {
+	mm.users = make(map[string]User)
+	mm.lobbies = make(map[uint64]Lobby)
+	mm.mutex = new(sync.Mutex)
 }

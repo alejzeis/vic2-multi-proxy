@@ -3,9 +3,9 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/gorilla/websocket"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/alejzeis/vic2-multi-proxy/common"
@@ -16,17 +16,24 @@ import (
 	"gopkg.in/ini.v1"
 )
 
-var infoResponseJSON []byte // Cached bytes of the JSON for the /info response
+type restServer struct {
+	infoResponseJSON []byte // Cached bytes of the JSON for the /info response
 
-var matchmaker *Matchmaker
-var secret []byte             // HMAC secret used for signing JWTs
-var lobbyIdCounter uint64 = 1 // Counter for setting lobby Ids
+	matchmaker *Matchmaker
+	relay      relayServer
 
-func verifyToken(tokenStr string) (bool, string) {
+	wsUpgrader *websocket.Upgrader
+
+	secret         []byte
+	lobbyIdCounter uint64
+	userIdCounter  uint64
+}
+
+func verifyToken(tokenStr string, secret []byte) (bool, string) {
 	decodedToken, err := jwt.ParseWithClaims(tokenStr, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
 		// Don't forget to validate the alg is what you expect:
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 
 		return secret, nil
@@ -48,16 +55,19 @@ func verifyToken(tokenStr string) (bool, string) {
 	return false, ""
 }
 
-func authMethodVerification(tokenStr string, w http.ResponseWriter) (bool, User) {
+func (rs *restServer) authMethodVerification(tokenStr string, w http.ResponseWriter) (bool, User) {
 	// Verify their JWT is valid
-	valid, username := verifyToken(tokenStr)
+	valid, username := verifyToken(tokenStr, rs.secret)
 	if !valid {
 		w.WriteHeader(http.StatusForbidden)
 		return false, User{}
 	}
 
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
+
 	// Verify we have their user in the matchmaker map
-	user, exists := matchmaker.users[username]
+	user, exists := rs.matchmaker.users[username]
 	if !exists {
 		w.WriteHeader(http.StatusNotFound)
 		return false, User{}
@@ -67,31 +77,31 @@ func authMethodVerification(tokenStr string, w http.ResponseWriter) (bool, User)
 }
 
 // Executes every 20 seconds and searches for users that haven't renewed their tokens, and deletes them so they can relogin again
-func findExpiredUserSessions() {
-	ticker := time.NewTicker(20 * time.Second)
+func (rs *restServer) findExpiredUserSessions() {
+	ticker := time.NewTicker(20 * time.Second) // Tick every 20 seconds
 	for range ticker.C {
-		matchmaker.mutex.Lock()
+		rs.matchmaker.mutex.Lock()
 
-		for _, user := range matchmaker.users {
+		for _, user := range rs.matchmaker.users {
 			expireTime := user.LastTokenAt.Add(2 * time.Minute)
 			if time.Now().After(expireTime) {
 				// Expire time is past the current time, their token has expired, time to delete the user
 				if user.Hosting > 0 {
 					// They are hosting a lobby, need to delete that too
-					delete(matchmaker.lobbies, user.Hosting)
+					delete(rs.matchmaker.lobbies, user.Hosting)
 				}
-				delete(matchmaker.users, user.Username)
+				delete(rs.matchmaker.users, user.Username)
 
 				log.WithFields(log.Fields{
 					"username":   user.Username,
 					"hosting":    user.Hosting,
 					"linked":     user.Linkedto,
 					"expireTime": expireTime,
-				}).Info("Removed expired user session")
+				}).Debug("Removed expired user session")
 			}
 		}
 
-		matchmaker.mutex.Unlock()
+		rs.matchmaker.mutex.Unlock()
 	}
 }
 
@@ -99,22 +109,25 @@ func findExpiredUserSessions() {
 func StartControlServer(config *ini.File, mm *Matchmaker) {
 	log.Info("Starting REST API HTTP Server...")
 
-	infoResponseJSON, _ = json.Marshal(common.InfoResponse{common.SoftwareName, common.SoftwareVersion, common.APIVersion})
+	server := new(restServer)
+	server.lobbyIdCounter = 1 // Lobby IDs start at 1, since 0 represents not linked to a lobby
+	server.infoResponseJSON, _ = json.Marshal(common.InfoResponse{Software: common.SoftwareName, Version: common.SoftwareVersion, API: common.APIVersion})
+	server.matchmaker = mm
 
-	mm.mutex = &sync.Mutex{}
-	mm.users = make(map[string]User)
-	mm.lobbies = make(map[uint64]Lobby)
-	matchmaker = mm
+	server.wsUpgrader = new(websocket.Upgrader)
+	server.wsUpgrader.ReadBufferSize = 2048
+	server.wsUpgrader.WriteBufferSize = 2048
 
 	router := mux.NewRouter().StrictSlash(true)
-	router.HandleFunc("/info", handleInfo).Methods("GET")
-	router.HandleFunc("/login/{username}", handleLogin).Methods("POST")
-	router.HandleFunc("/logout/{token}", handleLogout).Methods("GET")
-	router.HandleFunc("/renew/{token}", handleRenew).Methods("GET")
-	router.HandleFunc("/checkin/{token}", handleCheckin).Methods("GET")
-	router.HandleFunc("/host/{token}", handleUpdateHostStatus).Methods("PUT")
-	router.HandleFunc("/host/{token}", handleDeleteHostStatus).Methods("DELETE")
-	router.HandleFunc("/link/{token}/{lobbyid}", handleUpdateLinkStatus).Methods("PUT")
+	router.HandleFunc("/relay", server.handleWebsocketUpgrade)
+	router.HandleFunc("/info", server.handleInfo).Methods("GET")
+	router.HandleFunc("/login/{username}", server.handleLogin).Methods("POST")
+	router.HandleFunc("/logout/{token}", server.handleLogout).Methods("GET")
+	router.HandleFunc("/renew/{token}", server.handleRenew).Methods("GET")
+	router.HandleFunc("/checkin/{token}", server.handleCheckin).Methods("GET")
+	router.HandleFunc("/host/{token}", server.handleUpdateHostStatus).Methods("PUT")
+	router.HandleFunc("/host/{token}", server.handleDeleteHostStatus).Methods("DELETE")
+	router.HandleFunc("/link/{token}/{lobbyid}", server.handleUpdateLinkStatus).Methods("PUT")
 
 	portKey, err := config.Section("server").GetKey("port")
 	if err != nil {
@@ -133,18 +146,29 @@ func StartControlServer(config *ini.File, mm *Matchmaker) {
 		panic(err)
 	}
 
-	secret = []byte(secretKey.String())
+	server.secret = []byte(secretKey.String())
 
-	go findExpiredUserSessions()
+	go server.findExpiredUserSessions()
 
 	log.WithError(http.ListenAndServe(":"+strconv.Itoa(port), router)).WithField("port", port).Error("Failed to start listening")
 }
 
+// This handles the endpoint /relay, which then upgrades the connection to a websocket connection and passes it to the relay server
+func (rs *restServer) handleWebsocketUpgrade(w http.ResponseWriter, r *http.Request) {
+	ws, err := rs.wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.WithError(err).WithField("address", r.RemoteAddr).Warn("Failed to upgrade connection to websocket connection")
+	} else {
+		log.WithField("address", r.RemoteAddr).Debug("Websocket connection upgraded, sent to relay")
+		rs.relay.registerNewConnection(ws)
+	}
+}
+
 // Returns server information such as the software version and REST API version
-func handleInfo(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(infoResponseJSON)
+	w.Write(rs.infoResponseJSON)
 }
 
 // Handles a login from a client and issues a JWT with their username
@@ -153,10 +177,10 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 //   - 409 Conflict: There's already a valid token that exists for the client (already logged in)
 //   - 500 Internal Server Error: Failed to encode the JWT
 //   - 201 Created: Successfully created user entry, and returns a JWT for use with other REST methods
-func handleLogin(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	username := vars["username"]
@@ -168,7 +192,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, exists := matchmaker.users[username]
+	_, exists := rs.matchmaker.users[username]
 	if exists {
 		w.WriteHeader(http.StatusConflict)
 		return
@@ -177,24 +201,27 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
 		"iss": common.SoftwareName,
 		"sub": username,
+		"uid": rs.userIdCounter,
 		"iat": time.Now().Unix(),
 		"exp": time.Now().Local().Add(time.Minute * 2).Unix(),
 	})
 
-	signedToken, err := t.SignedString(secret)
+	signedToken, err := t.SignedString(rs.secret)
 	if err != nil {
 		log.WithField("username", username).WithError(err).Error("Failed to encode JWT for a login request.")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	matchmaker.users[username] = User{
+	rs.matchmaker.users[username] = User{
+		ID:          rs.userIdCounter,
 		Address:     nil,
 		Username:    username,
 		Linkedto:    0, // No Lobby linked to
 		Hosting:     0, // 0, no lobby hosting
 		LastTokenAt: time.Now(),
 	}
+	rs.userIdCounter++
 
 	log.WithFields(log.Fields{
 		"username": username,
@@ -211,10 +238,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 //   - 403 Forbidden: JWT wasn't valid
 //   - 404 Not Found: Username wasn't found in the program's map
 //   - 204 No Content: Successfully logged out
-func handleLogout(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	token := vars["token"]
@@ -224,22 +251,25 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	success, user := authMethodVerification(token, w)
+	success, user := rs.authMethodVerification(token, w)
 	if !success {
 		return
 	}
 
 	if user.Hosting > 0 {
 		// User is hosting a lobby, need to remove the lobby from the server
+
+		rs.relay.onUserStopHosting(user, rs.matchmaker.lobbies[user.Hosting]) // Notify the relay server the user is stopping hosting
+
 		// First we need to find all the users linked to it, and update their struct to show they aren't linked anymore
-		for key, val := range matchmaker.users {
+		for key, val := range rs.matchmaker.users {
 			if val.Linkedto == user.Hosting {
 				val.Linkedto = 0
-				matchmaker.users[key] = val
+				rs.matchmaker.users[key] = val
 			}
 		}
 		// Then we delete the lobby struct
-		delete(matchmaker.lobbies, user.Hosting)
+		delete(rs.matchmaker.lobbies, user.Hosting)
 	}
 
 	log.WithFields(log.Fields{
@@ -247,7 +277,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		"address":  r.RemoteAddr,
 	}).Info("New Logout")
 
-	delete(matchmaker.users, user.Username)
+	delete(rs.matchmaker.users, user.Username)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -258,10 +288,10 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 //   - 404 Not Found: Username wasn't found in the program's map
 //   - 500 Internal Server Error: Failed to encode the JWT
 //   - 200 OK: Successfully created new token, returns new JWT
-func handleRenew(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	token := vars["token"]
@@ -272,7 +302,7 @@ func handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify token
-	success, user := authMethodVerification(token, w)
+	success, user := rs.authMethodVerification(token, w)
 	if !success {
 		return
 	}
@@ -281,11 +311,12 @@ func handleRenew(w http.ResponseWriter, r *http.Request) {
 	t := jwt.NewWithClaims(jwt.SigningMethodHS384, jwt.MapClaims{
 		"iss": common.SoftwareName,
 		"sub": user.Username,
+		"uid": user.ID,
 		"iat": issuedTime.Unix(),
 		"exp": issuedTime.Local().Add(time.Minute * 2).Unix(),
 	})
 
-	signedToken, err := t.SignedString(secret)
+	signedToken, err := t.SignedString(rs.secret)
 	if err != nil {
 		log.WithField("username", user.Username).WithError(err).Error("Failed to encode JWT for renewal.")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -293,7 +324,7 @@ func handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user.LastTokenAt = issuedTime
-	matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.Username] = user
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, signedToken)
@@ -305,10 +336,10 @@ func handleRenew(w http.ResponseWriter, r *http.Request) {
 //   - 403 Forbidden: JWT wasn't valid
 //   - 404 Not Found: Username wasn't found in the program's map
 //   - 200 OK: Success, returns checkinResponse struct (JSON)
-func handleCheckin(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	token := vars["token"]
@@ -318,13 +349,13 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	success, user := authMethodVerification(token, w)
+	success, user := rs.authMethodVerification(token, w)
 	if !success {
 		return
 	}
 
 	lobbyMap := make(map[string]common.RestLobby)
-	for _, val := range matchmaker.lobbies {
+	for _, val := range rs.matchmaker.lobbies {
 		lobbyMap[strconv.FormatUint(val.ID, 10)] = common.RestLobby{Name: val.Name, Host: val.HostUsername}
 	}
 
@@ -364,10 +395,10 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 //   - 404 Not Found: Username wasn't found in the program's map
 //   - 409 Conflict: User is linked to a lobby, or is already hosting
 //   - 204 No content: Successfully hosting lobby
-func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	token := vars["token"]
@@ -378,7 +409,7 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	success, user := authMethodVerification(token, w)
+	success, user := rs.authMethodVerification(token, w)
 	if !success {
 		return
 	}
@@ -402,23 +433,24 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lobby := Lobby{
-		ID:           lobbyIdCounter,
+		ID:           rs.lobbyIdCounter,
 		Name:         r.FormValue("name"),
 		Password:     r.FormValue("password"),
 		HostUsername: user.Username,
 	}
 
-	matchmaker.lobbies[lobbyIdCounter] = lobby
-	user.Hosting = lobbyIdCounter
-	matchmaker.users[user.Username] = user
-	lobbyIdCounter++
+	rs.matchmaker.lobbies[rs.lobbyIdCounter] = lobby
+	user.Hosting = rs.lobbyIdCounter
+	rs.matchmaker.users[user.Username] = user
+	rs.lobbyIdCounter++
 
 	log.WithFields(log.Fields{
-		"username": user.Username,
-		"lobby":    r.FormValue("name"),
+		"hostedBy": user.Username,
+		"id":       lobby.ID,
+		"name":     lobby.Name,
 	}).Info("New lobby created")
 
-	// TODO: Notify TCP Tunnel Proxy here
+	rs.relay.onUserStartHosting(user, lobby)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -430,10 +462,10 @@ func handleUpdateHostStatus(w http.ResponseWriter, r *http.Request) {
 //   - 403 Forbidden: JWT wasn't valid
 //   - 404 Not Found: Username wasn't found in the program's map, or user isn't hosting a lobby
 //   - 204 No content: Successfully deleted lobby
-func handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	token := vars["token"]
@@ -444,7 +476,7 @@ func handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	success, user := authMethodVerification(token, w)
+	success, user := rs.authMethodVerification(token, w)
 	if !success {
 		return
 	}
@@ -455,18 +487,20 @@ func handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name := matchmaker.lobbies[user.Hosting].Name
-	delete(matchmaker.lobbies, user.Hosting)
+	rs.relay.onUserStopHosting(user, rs.matchmaker.lobbies[user.Hosting]) // Notify relay server that the user isn't hosting anymore
+
+	name := rs.matchmaker.lobbies[user.Hosting].Name
+	id := rs.matchmaker.lobbies[user.Hosting].ID
+	delete(rs.matchmaker.lobbies, user.Hosting)
 
 	user.Hosting = 0
-	matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.Username] = user
 
 	log.WithFields(log.Fields{
-		"username": user.Username,
-		"lobby":    name,
+		"hostedBy": user.Username,
+		"id":       id,
+		"name":     name,
 	}).Info("Lobby deleted")
-
-	// TODO: Notify TCP Tunnel Proxy here
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -480,10 +514,10 @@ func handleDeleteHostStatus(w http.ResponseWriter, r *http.Request) {
 //   - 409 Conflict: User is hosting a lobby, can't link while hosting
 //   - 423 Locked: Lobby the client wants to link to is password-protected (TODO)
 //   - 204 No content: Successfully linked to lobby
-func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
+func (rs *restServer) handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 	// Lock the mutex so we don't have a race condition while reading/adding stuff to the users map
-	matchmaker.mutex.Lock()
-	defer matchmaker.mutex.Unlock()
+	rs.matchmaker.mutex.Lock()
+	defer rs.matchmaker.mutex.Unlock()
 
 	vars := mux.Vars(r)
 	token := vars["token"]
@@ -495,7 +529,7 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	success, user := authMethodVerification(token, w)
+	success, user := rs.authMethodVerification(token, w)
 	if !success {
 		return
 	}
@@ -507,23 +541,24 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 
 	if lobbyid == 0 {
 		// They want to unlink from their lobby
+
+		rs.relay.onUserUnlinkLobby(user, rs.matchmaker.lobbies[user.Linkedto]) // Notify relay server they aren't linked anymore
+
 		oldLobby := user.Linkedto
 		user.Linkedto = 0
-		matchmaker.users[user.Username] = user
+		rs.matchmaker.users[user.Username] = user
 		w.WriteHeader(http.StatusNoContent)
 
 		log.WithFields(log.Fields{
 			"username": user.Username,
-			"lobby":    oldLobby,
+			"lobbyId":  oldLobby,
 		}).Info("Unlinked from lobby")
-
-		// TODO: Notify TCP Tunnel Proxy here
 		return
 	}
 
 	// Check to make sure the lobby actually exists
 	lobbyIdExists := false
-	for key := range matchmaker.lobbies {
+	for key := range rs.matchmaker.lobbies {
 		if key == lobbyid {
 			lobbyIdExists = true
 			break
@@ -536,20 +571,20 @@ func handleUpdateLinkStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TODO: PASSWORD PROTECTED LOBBIES SUPPORT
-	if matchmaker.lobbies[lobbyid].Password != "" {
+	if rs.matchmaker.lobbies[lobbyid].Password != "" {
 		w.WriteHeader(http.StatusLocked)
 		return
 	}
 
 	user.Linkedto = lobbyid
-	matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.Username] = user
 
 	log.WithFields(log.Fields{
 		"username": user.Username,
-		"lobby":    user.Linkedto,
+		"lobbyId":  user.Linkedto,
 	}).Info("Linked to lobby")
 
-	// TODO: Notify TCP Tunnel Proxy here
+	rs.relay.onUserLinkLobby(user, rs.matchmaker.lobbies[user.Linkedto]) // Notify relay server they are linked to a lobby
 
 	w.WriteHeader(http.StatusNoContent)
 }
