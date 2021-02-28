@@ -71,11 +71,26 @@ func (client *proxyClient) handleIncomingData() {
 	for {
 		msgType, data, err := client.connection.ReadMessage()
 		if err != nil {
-			log.WithError(err).WithFields(log.Fields{
-				"userId":     client.userId,
-				"remoteAddr": client.connection.RemoteAddr().String(),
-				"msgType":    msgType,
-			}).Error("Error while reading data from client relay connection")
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+				log.WithError(err).WithFields(log.Fields{
+					"userId":     client.userId,
+					"remoteAddr": client.connection.RemoteAddr().String(),
+					"msgType":    msgType,
+				}).Info("Relay connection closed")
+				return // Exit function
+			} else if websocket.IsUnexpectedCloseError(err) {
+				log.WithError(err).WithFields(log.Fields{
+					"userId":     client.userId,
+					"remoteAddr": client.connection.RemoteAddr().String(),
+					"msgType":    msgType,
+				}).Info("Relay connection unexpectedly closed")
+				return // Exit function
+			} else {
+				log.WithError(err).WithFields(log.Fields{
+					"userId":     client.userId,
+					"remoteAddr": client.connection.RemoteAddr().String(),
+				}).Error("Error while reading data from client relay connection")
+			}
 			return
 		} else {
 			switch msgType {

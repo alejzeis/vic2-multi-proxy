@@ -398,7 +398,6 @@ func (rs *restServer) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
-	log.Debug("Checkin Complete")
 }
 
 // Called by any client when they want to host a lobby for linking on the proxy

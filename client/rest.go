@@ -60,7 +60,6 @@ func (rc *restClient) continuousCheckin() {
 
 		if !sleeping {
 			rc.mutex.Lock()
-			log.Debug("Mutex locked in checkin")
 
 			success := rc.checkin()
 			if success {
@@ -75,7 +74,6 @@ func (rc *restClient) continuousCheckin() {
 			}
 
 			rc.mutex.Unlock()
-			log.Debug("Mutex unlocked in checkin")
 		}
 	}
 
@@ -164,7 +162,7 @@ func (rc *restClient) checkin() bool {
 
 		if linkedToLobbyPrior && rc.lastCheckin.LinkedLobby == 0 {
 			log.Error("Remote Lobby closed.")
-			rc.relay.onStopLinked()
+			rc.relay.OnStopLinked()
 		}
 
 		return true
@@ -199,7 +197,7 @@ func (rc *restClient) Connect(username string) bool {
 		log.Info("Successfully logged into server.")
 
 		// Attempt relay connection
-		if rc.relay.onConnectedToServer(rc.serverURL, rc.authToken) {
+		if rc.relay.OnConnectedToServer(rc.serverURL, rc.authToken) {
 			rc.checkinChannel <- true // Signal checkin goroutine to do checkins periodically
 			rc.authToken = response.String()
 			rc.lastRenewedAt = time.Now()
@@ -242,7 +240,7 @@ func (rc *restClient) completeDisconnect() {
 	rc.checkinChannel <- false // Stop periodic checkins
 	rc.authToken = ""
 
-	rc.relay.onDisconnectedFromServer()
+	rc.relay.OnDisconnectedFromServer()
 }
 
 func (rc *restClient) Link(lobbyIdStr string) bool {
@@ -272,7 +270,7 @@ func (rc *restClient) Link(lobbyIdStr string) bool {
 		lobbyId, _ := strconv.Atoi(lobbyIdStr)
 		rc.lastCheckin.LinkedLobby = uint64(lobbyId)
 
-		rc.relay.onBeginLinked()
+		rc.relay.OnBeginLinked()
 
 		return true
 	}
@@ -299,7 +297,7 @@ func (rc *restClient) Unlink() bool {
 		log.Info("Successfully unlinked from lobby")
 
 		rc.lastCheckin.LinkedLobby = 0
-		rc.relay.onStopLinked()
+		rc.relay.OnStopLinked()
 
 		return true
 	}
@@ -329,7 +327,7 @@ func (rc *restClient) Host(lobbyName string, password string) bool {
 		log.Info("Successfully created lobby and now hosting")
 
 		rc.lastCheckin.Hosting = true
-		rc.relay.onBeginHosting()
+		rc.relay.OnBeginHosting()
 
 		return true
 	}
@@ -356,7 +354,7 @@ func (rc *restClient) StopHost() bool {
 		log.Info("Successfully deleted lobby and stopped hosting")
 
 		rc.lastCheckin.Hosting = false
-		rc.relay.onStopHosting()
+		rc.relay.OnStopHosting()
 
 		return true
 	}
