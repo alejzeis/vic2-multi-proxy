@@ -28,7 +28,9 @@ func main() {
 		matchmaker := new(server.Matchmaker)
 		matchmaker.Init()
 
-		server.StartControlServer(config, matchmaker)
+		relay := new(server.RelayServerImpl)
+
+		server.StartControlServer(config, matchmaker, relay)
 	} else {
 		log.WithFields(log.Fields{
 			"software": common.SoftwareName,

@@ -1,5 +1,7 @@
 package common
 
+import "github.com/dgrijalva/jwt-go"
+
 // SoftwareName is the name of this software
 const SoftwareName = "vic2-multi-proxy"
 
@@ -27,4 +29,10 @@ type CheckinResponse struct {
 type RestLobby struct {
 	Name string `json:"name"`
 	Host string `json:"host"`
+}
+
+// JWT Claims type for the authentication token
+type AuthTokenCustomClaims struct {
+	UserID uint64 `json:"uid"`
+	jwt.StandardClaims
 }

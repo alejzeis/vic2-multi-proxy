@@ -116,7 +116,8 @@ func (r *restClient) checkin() {
 	url := r.serverURL + "/checkin/" + r.authToken
 	response, err := r.rest.R().Get(url)
 	if err != nil {
-		log.WithField("url", url).WithError(err).Warn("Failed to process checkin.")
+		log.WithField("url", url).WithError(err).Error("Failed to process checkin.")
+		panic("Lost connection to server")
 	} else if response.StatusCode() != http.StatusOK {
 		log.WithFields(log.Fields{
 			"url":    url,
@@ -197,9 +198,14 @@ func (r *restClient) disconnect() {
 		}).Error("Failed to logout")
 	} else {
 		log.Info("Successfully logged out of server.")
-		r.stop = true
-		r.authToken = ""
+		r.completeDisconnect()
 	}
+}
+
+// Not thread safe
+func (r *restClient) completeDisconnect() {
+	r.stop = true
+	r.authToken = ""
 }
 
 func (r *restClient) link(lobbyIdStr string) bool {

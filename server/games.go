@@ -18,21 +18,23 @@ type User struct {
 
 // Lobby represents a lobby hosted by a user on the proxy server.
 type Lobby struct {
-	ID           uint64
-	Name         string
-	HostUsername string
-	Password     string
+	ID         uint64
+	Name       string
+	HostUserID uint64
+	Password   string
 }
 
-// Matchmaker holds the current users logged in and their status
+// Matchmaker is a structure that allows keeping track of users and lobbies.
 type Matchmaker struct {
-	users   map[string]User
+	// Map of user Ids matched to User structs
+	users map[uint64]User
+	// Map of lobby Ids matched to Lobby structs
 	lobbies map[uint64]Lobby
 	mutex   *sync.Mutex
 }
 
 func (mm *Matchmaker) Init() {
-	mm.users = make(map[string]User)
+	mm.users = make(map[uint64]User)
 	mm.lobbies = make(map[uint64]Lobby)
-	mm.mutex = new(sync.Mutex)
+	mm.mutex = &sync.Mutex{}
 }

@@ -20,7 +20,7 @@ type restServer struct {
 	infoResponseJSON []byte // Cached bytes of the JSON for the /info response
 
 	matchmaker *Matchmaker
-	relay      relayServer
+	relay      RelayServer
 
 	wsUpgrader *websocket.Upgrader
 
@@ -29,8 +29,8 @@ type restServer struct {
 	userIdCounter  uint64
 }
 
-func verifyToken(tokenStr string, secret []byte) (bool, string) {
-	decodedToken, err := jwt.ParseWithClaims(tokenStr, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
+func verifyToken(tokenStr string, secret []byte) (bool, *common.AuthTokenCustomClaims) {
+	decodedToken, err := jwt.ParseWithClaims(tokenStr, &common.AuthTokenCustomClaims{}, func(token *jwt.Token) (interface{}, error) {
 		// Don't forget to validate the alg is what you expect:
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -41,33 +41,31 @@ func verifyToken(tokenStr string, secret []byte) (bool, string) {
 
 	if err != nil {
 		log.WithError(err).Warn("Failed to decode token, probably invalid signature")
-		return false, ""
+		return false, nil
 	}
 
-	if claims, ok := decodedToken.Claims.(*jwt.StandardClaims); ok && decodedToken.Valid {
+	if claims, ok := decodedToken.Claims.(*common.AuthTokenCustomClaims); ok && decodedToken.Valid {
 		if time.Now().After(time.Unix(claims.ExpiresAt, 0)) {
-			return false, ""
+			return false, nil
 		}
 
-		return true, claims.Subject
+		return true, claims
 	}
 
-	return false, ""
+	return false, nil
 }
 
+// NOT thread safe
 func (rs *restServer) authMethodVerification(tokenStr string, w http.ResponseWriter) (bool, User) {
 	// Verify their JWT is valid
-	valid, username := verifyToken(tokenStr, rs.secret)
+	valid, tokenClaims := verifyToken(tokenStr, rs.secret)
 	if !valid {
 		w.WriteHeader(http.StatusForbidden)
 		return false, User{}
 	}
 
-	rs.matchmaker.mutex.Lock()
-	defer rs.matchmaker.mutex.Unlock()
-
 	// Verify we have their user in the matchmaker map
-	user, exists := rs.matchmaker.users[username]
+	user, exists := rs.matchmaker.users[tokenClaims.UserID]
 	if !exists {
 		w.WriteHeader(http.StatusNotFound)
 		return false, User{}
@@ -90,7 +88,7 @@ func (rs *restServer) findExpiredUserSessions() {
 					// They are hosting a lobby, need to delete that too
 					delete(rs.matchmaker.lobbies, user.Hosting)
 				}
-				delete(rs.matchmaker.users, user.Username)
+				delete(rs.matchmaker.users, user.ID)
 
 				log.WithFields(log.Fields{
 					"username":   user.Username,
@@ -106,13 +104,14 @@ func (rs *restServer) findExpiredUserSessions() {
 }
 
 // StartControlServer begins handling HTTP requests for the REST API, called by main function
-func StartControlServer(config *ini.File, mm *Matchmaker) {
+func StartControlServer(config *ini.File, mm *Matchmaker, relay RelayServer) {
 	log.Info("Starting REST API HTTP Server...")
 
 	server := new(restServer)
 	server.lobbyIdCounter = 1 // Lobby IDs start at 1, since 0 represents not linked to a lobby
 	server.infoResponseJSON, _ = json.Marshal(common.InfoResponse{Software: common.SoftwareName, Version: common.SoftwareVersion, API: common.APIVersion})
 	server.matchmaker = mm
+	server.relay = relay
 
 	server.wsUpgrader = new(websocket.Upgrader)
 	server.wsUpgrader.ReadBufferSize = 2048
@@ -147,6 +146,8 @@ func StartControlServer(config *ini.File, mm *Matchmaker) {
 	}
 
 	server.secret = []byte(secretKey.String())
+
+	server.relay.initialize(server.secret, mm)
 
 	go server.findExpiredUserSessions()
 
@@ -192,7 +193,13 @@ func (rs *restServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, exists := rs.matchmaker.users[username]
+	exists := false
+	for _, user := range rs.matchmaker.users {
+		if user.Username == username {
+			exists = true
+			break
+		}
+	}
 	if exists {
 		w.WriteHeader(http.StatusConflict)
 		return
@@ -213,7 +220,7 @@ func (rs *restServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rs.matchmaker.users[username] = User{
+	rs.matchmaker.users[rs.userIdCounter] = User{
 		ID:          rs.userIdCounter,
 		Address:     nil,
 		Username:    username,
@@ -221,12 +228,13 @@ func (rs *restServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Hosting:     0, // 0, no lobby hosting
 		LastTokenAt: time.Now(),
 	}
-	rs.userIdCounter++
 
 	log.WithFields(log.Fields{
 		"username": username,
+		"userID":   rs.userIdCounter,
 		"address":  r.RemoteAddr,
 	}).Info("New Login")
+	rs.userIdCounter++
 
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprint(w, signedToken)
@@ -274,10 +282,11 @@ func (rs *restServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 	log.WithFields(log.Fields{
 		"username": user.Username,
+		"userID":   user.ID,
 		"address":  r.RemoteAddr,
 	}).Info("New Logout")
 
-	delete(rs.matchmaker.users, user.Username)
+	delete(rs.matchmaker.users, user.ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -318,13 +327,16 @@ func (rs *restServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 
 	signedToken, err := t.SignedString(rs.secret)
 	if err != nil {
-		log.WithField("username", user.Username).WithError(err).Error("Failed to encode JWT for renewal.")
+		log.WithFields(log.Fields{
+			"username": user.Username,
+			"userID":   user.ID,
+		}).WithError(err).Error("Failed to encode JWT for renewal.")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	user.LastTokenAt = issuedTime
-	rs.matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.ID] = user
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, signedToken)
@@ -356,7 +368,7 @@ func (rs *restServer) handleCheckin(w http.ResponseWriter, r *http.Request) {
 
 	lobbyMap := make(map[string]common.RestLobby)
 	for _, val := range rs.matchmaker.lobbies {
-		lobbyMap[strconv.FormatUint(val.ID, 10)] = common.RestLobby{Name: val.Name, Host: val.HostUsername}
+		lobbyMap[strconv.FormatUint(val.ID, 10)] = common.RestLobby{Name: val.Name, Host: rs.matchmaker.users[val.HostUserID].Username}
 	}
 
 	var isHosting bool
@@ -375,6 +387,7 @@ func (rs *restServer) handleCheckin(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		log.WithError(err).WithFields(log.Fields{
 			"user":     user.Username,
+			"userID":   user.ID,
 			"address":  r.RemoteAddr,
 			"hosting":  user.Hosting,
 			"linkedTo": user.Linkedto,
@@ -385,6 +398,7 @@ func (rs *restServer) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+	log.Debug("Checkin Complete")
 }
 
 // Called by any client when they want to host a lobby for linking on the proxy
@@ -424,6 +438,7 @@ func (rs *restServer) handleUpdateHostStatus(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
 			"username": user.Username,
+			"userID":   user.ID,
 			"address":  r.RemoteAddr,
 		}).Warning("Failed to parse form for /host API endpoint")
 	}
@@ -433,21 +448,22 @@ func (rs *restServer) handleUpdateHostStatus(w http.ResponseWriter, r *http.Requ
 	}
 
 	lobby := Lobby{
-		ID:           rs.lobbyIdCounter,
-		Name:         r.FormValue("name"),
-		Password:     r.FormValue("password"),
-		HostUsername: user.Username,
+		ID:         rs.lobbyIdCounter,
+		Name:       r.FormValue("name"),
+		Password:   r.FormValue("password"),
+		HostUserID: user.ID,
 	}
 
 	rs.matchmaker.lobbies[rs.lobbyIdCounter] = lobby
 	user.Hosting = rs.lobbyIdCounter
-	rs.matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.ID] = user
 	rs.lobbyIdCounter++
 
 	log.WithFields(log.Fields{
-		"hostedBy": user.Username,
-		"id":       lobby.ID,
-		"name":     lobby.Name,
+		"hostedBy":   user.Username,
+		"hostUserID": user.ID,
+		"id":         lobby.ID,
+		"name":       lobby.Name,
 	}).Info("New lobby created")
 
 	rs.relay.onUserStartHosting(user, lobby)
@@ -494,12 +510,13 @@ func (rs *restServer) handleDeleteHostStatus(w http.ResponseWriter, r *http.Requ
 	delete(rs.matchmaker.lobbies, user.Hosting)
 
 	user.Hosting = 0
-	rs.matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.ID] = user
 
 	log.WithFields(log.Fields{
-		"hostedBy": user.Username,
-		"id":       id,
-		"name":     name,
+		"hostedBy":   user.Username,
+		"hostUserID": user.ID,
+		"id":         id,
+		"name":       name,
 	}).Info("Lobby deleted")
 
 	w.WriteHeader(http.StatusNoContent)
@@ -546,11 +563,12 @@ func (rs *restServer) handleUpdateLinkStatus(w http.ResponseWriter, r *http.Requ
 
 		oldLobby := user.Linkedto
 		user.Linkedto = 0
-		rs.matchmaker.users[user.Username] = user
+		rs.matchmaker.users[user.ID] = user
 		w.WriteHeader(http.StatusNoContent)
 
 		log.WithFields(log.Fields{
 			"username": user.Username,
+			"userID":   user.ID,
 			"lobbyId":  oldLobby,
 		}).Info("Unlinked from lobby")
 		return
@@ -577,10 +595,11 @@ func (rs *restServer) handleUpdateLinkStatus(w http.ResponseWriter, r *http.Requ
 	}
 
 	user.Linkedto = lobbyid
-	rs.matchmaker.users[user.Username] = user
+	rs.matchmaker.users[user.ID] = user
 
 	log.WithFields(log.Fields{
 		"username": user.Username,
+		"userID":   user.ID,
 		"lobbyId":  user.Linkedto,
 	}).Info("Linked to lobby")
 

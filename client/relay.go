@@ -23,8 +23,7 @@ func createStartRelay() *gameRelayImpl {
 type channelSignal uint8
 
 const (
-	SHUTDOWN channelSignal = iota
-	DISCONNECTED_MATCHMAKING
+	DISCONNECTED_MATCHMAKING channelSignal = iota
 	BEGIN_HOSTING_FORWARDING
 	BEGIN_LINKED_FORWARDING
 	STOP_FORWARDING
@@ -98,7 +97,6 @@ func (proxy *virtualGameProxy) relayDataLocalToRemote(hosting bool) {
 		}
 
 		log.WithField("proxyIdentifier", proxy.identifier).Debug("Stopped listening for local game data")
-		proxy.signalChannel <- SHUTDOWN // Re-send signal so the shutdown function knows we are terminated
 	}()
 
 	if hosting {
@@ -118,16 +116,15 @@ func (proxy *virtualGameProxy) relayDataLocalToRemote(hosting bool) {
 				"localAddress":    proxy.socket.LocalAddr().String(),
 				"remoteAddress":   address,
 				"proxyIdentifier": proxy.identifier,
-			}).Warn("Error while reading data from local listening socket")
+			}).Error("Error while reading data from local listening socket")
 		} else if proxy.gameAddress == nil {
 			// TODO: Maybe parse packet to ensure it's a real packet from the game?
 			proxy.gameAddress = address
 		}
 
 		select {
-		case signal := <-proxy.signalChannel:
-			switch signal {
-			case SHUTDOWN:
+		case _, notClosed := <-proxy.signalChannel:
+			if !notClosed {
 				return // Exit function, stopping the thread
 			}
 		default:
@@ -169,17 +166,13 @@ func (relay *gameRelayImpl) sendContainerToServer(container common.GameDataConta
 
 func (relay *gameRelayImpl) shutdown() {
 	for _, proxy := range relay.localProxies {
-		proxy.signalChannel <- SHUTDOWN
+		close(proxy.signalChannel)
+		proxy.socket.Close() // Close the socket, since the UDP reads are blocking we need to close the socket to get the goroutines to terminate
 	}
-	relay.remoteSignalChannel <- SHUTDOWN
+	close(relay.remoteSignalChannel)
 
-	log.WithField("proxyCount", len(relay.localProxies)).Info("Sent shutdown signal to all proxy threads, waiting for exits...")
-	// Await on their threads to exit (should send a message telling us shutdown complete
-	<-relay.remoteSignalChannel
-	for _, proxy := range relay.localProxies {
-		<-proxy.signalChannel
-	}
-	log.Info("All proxy threads exited.")
+	log.WithField("proxyCount", len(relay.localProxies)).Debug("Sent shutdown signal to all proxy goroutines")
+	log.Debug("All proxy goroutines exited.")
 }
 
 func (relay *gameRelayImpl) relayDataRemoteToLocal() {
@@ -190,24 +183,25 @@ func (relay *gameRelayImpl) relayDataRemoteToLocal() {
 		if err != nil {
 			log.WithError(err).WithField("address", relay.serverAddress).Error("Failed to close websocket connection to relay server.")
 		}
-		relay.remoteSignalChannel <- SHUTDOWN // Re-send signal so the shutdown function knows we are terminated
 	}()
 
 	for {
 		select {
-		case signal := <-relay.remoteSignalChannel:
-			switch signal {
-			case DISCONNECTED_MATCHMAKING:
+		case signal, notClosed := <-relay.remoteSignalChannel:
+			if notClosed {
+				switch signal {
+				case DISCONNECTED_MATCHMAKING:
+					return // Exit function, stopping the thread
+				case STOP_FORWARDING:
+					forwarding = false
+				case BEGIN_HOSTING_FORWARDING:
+					forwarding = true
+					hosting = true
+				case BEGIN_LINKED_FORWARDING:
+					forwarding = true
+				}
+			} else { // Channel closed, that's the signal to terminate
 				return // Exit function, stopping the thread
-			case SHUTDOWN:
-				return // Exit function, stopping the thread
-			case STOP_FORWARDING:
-				forwarding = false
-			case BEGIN_HOSTING_FORWARDING:
-				forwarding = true
-				hosting = true
-			case BEGIN_LINKED_FORWARDING:
-				forwarding = true
 			}
 			break
 		default:
@@ -229,7 +223,23 @@ func (relay *gameRelayImpl) relayDataRemoteToLocal() {
 			relay.mutex.Lock()
 
 			proxy, found := relay.localProxies[container.Identifier]
-			if found {
+			if !found && hosting {
+				// Proxy instance wasn't found, so it must be a new connection.
+				// Create a new virtualGameProxy to represent this connection
+				proxy = &virtualGameProxy{
+					identifier:    container.Identifier,
+					socket:        nil,
+					relay:         relay,
+					signalChannel: make(chan channelSignal),
+				}
+				relay.localProxies[proxy.identifier] = proxy
+				proxy.initSocket(0) // Don't have a specific port to bind to since we are emulating a client
+				go proxy.relayDataLocalToRemote(true)
+
+				log.WithField("identifier", proxy.identifier).Debug("Created new virtualgame proxy")
+			}
+
+			if hosting {
 				err = proxy.sendGamePacket(container)
 				if err != nil {
 					log.WithError(err).WithFields(log.Fields{
@@ -240,18 +250,6 @@ func (relay *gameRelayImpl) relayDataRemoteToLocal() {
 						"hosting":      hosting,
 					}).Warn("Failed to send packet from remote to local game")
 				}
-			} else if hosting {
-				// Proxy instance wasn't found, so it must be a new connection.
-				// Create a new virtualGameProxy to represent this connection
-				proxy = &virtualGameProxy{
-					identifier:    proxy.identifier,
-					socket:        nil,
-					relay:         relay,
-					signalChannel: make(chan channelSignal),
-				}
-				relay.localProxies[proxy.identifier] = proxy
-				proxy.initSocket(0) // Don't have a specific port to bind to since we are emulating a client
-				go proxy.relayDataLocalToRemote(true)
 			}
 
 			relay.mutex.Unlock()
@@ -276,7 +274,7 @@ func (relay *gameRelayImpl) onConnectedToServer(address string, auth string) boo
 		return false
 	}
 
-	connection, _, err := websocket.DefaultDialer.Dial(relay.serverAddress, nil)
+	connection, _, err := websocket.DefaultDialer.Dial(relay.serverAddress+"/relay", nil)
 	if err != nil {
 		log.WithError(err).WithField("address", relay.serverAddress).Error("Failed to connect to relay server")
 		return false
@@ -298,9 +296,12 @@ func (relay *gameRelayImpl) onDisconnectedFromServer() {
 	defer relay.mutex.Unlock()
 
 	for _, proxy := range relay.localProxies {
-		proxy.signalChannel <- SHUTDOWN
-		<-proxy.signalChannel // Wait for thread to exit
+		close(proxy.signalChannel)
+		proxy.socket.Close() // Close the socket, since the UDP reads are blocking we need to close the socket to get the goroutines to terminate
 	}
+	relay.remoteConnection.WriteMessage(websocket.CloseMessage, []byte{})
+	relay.remoteConnection.Close() // Close the socket, since it's blocking the goroutine from exiting
+
 	relay.remoteSignalChannel <- DISCONNECTED_MATCHMAKING
 	relay.serverAddress = ""
 	relay.localProxies = make(map[uint64]*virtualGameProxy) // Overwrite the map, we don't need the old proxies anymore
@@ -324,8 +325,8 @@ func (relay *gameRelayImpl) onStopHosting() {
 	relay.remoteSignalChannel <- STOP_FORWARDING
 
 	for _, proxy := range relay.localProxies {
-		proxy.signalChannel <- SHUTDOWN
-		<-proxy.signalChannel // Wait for thread to exit
+		close(proxy.signalChannel)
+		proxy.socket.Close() // Close the socket, since the UDP reads are blocking we need to close the socket to get the goroutines to terminate
 	}
 	relay.localProxies = make(map[uint64]*virtualGameProxy) // Overwrite the map, we don't need the old proxies anymore
 }
@@ -357,8 +358,8 @@ func (relay *gameRelayImpl) onStopLinked() {
 
 	proxy, found := relay.localProxies[0] // ID zero for when we are emulating a hosted game; when linked we only need one Game proxy
 	if found {
-		proxy.signalChannel <- SHUTDOWN
-		<-proxy.signalChannel // Wait for thread to exit
+		close(proxy.signalChannel)
+		proxy.socket.Close() // Close the socket, since the UDP reads are blocking we need to close the socket to get the goroutines to terminate
 		delete(relay.localProxies, 0)
 	}
 }
