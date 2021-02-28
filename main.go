@@ -38,7 +38,8 @@ func main() {
 			"mode":     "client",
 		}).Info("Starting...")
 
-		client.RunClient()
+		c := client.NewClient(client.NewConsoleCommandSource(), client.CreateStartRelay())
+		c.RunClient()
 	}
 }
 

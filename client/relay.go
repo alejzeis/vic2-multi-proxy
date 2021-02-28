@@ -11,8 +11,8 @@ import (
 	"sync"
 )
 
-func createStartRelay() *gameRelayImpl {
-	relay := new(gameRelayImpl)
+func CreateStartRelay() *gameDataRelayImpl {
+	relay := new(gameDataRelayImpl)
 	relay.mutex = new(sync.Mutex)
 	relay.localProxies = make(map[uint64]*virtualGameProxy)
 	relay.remoteSignalChannel = make(chan channelSignal)
@@ -29,7 +29,7 @@ const (
 	STOP_FORWARDING
 )
 
-type gameRelay interface {
+type GameDataRelay interface {
 	shutdown()
 	sendContainerToServer(container common.GameDataContainer)
 	relayDataRemoteToLocal()
@@ -41,7 +41,7 @@ type gameRelay interface {
 	onStopLinked()
 }
 
-type gameRelayImpl struct {
+type gameDataRelayImpl struct {
 	mutex            *sync.Mutex
 	serverAddress    string
 	remoteConnection *websocket.Conn
@@ -59,7 +59,7 @@ type virtualGameProxy struct {
 	socket      *net.UDPConn
 	gameAddress *net.UDPAddr
 
-	relay gameRelay
+	relay GameDataRelay
 
 	signalChannel chan channelSignal
 }
@@ -153,7 +153,7 @@ func (proxy *virtualGameProxy) sendGamePacket(container common.GameDataContainer
 	}
 }
 
-func (relay *gameRelayImpl) sendContainerToServer(container common.GameDataContainer) {
+func (relay *gameDataRelayImpl) sendContainerToServer(container common.GameDataContainer) {
 	err := relay.remoteConnection.WriteMessage(websocket.BinaryMessage, container.Encode())
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -164,7 +164,7 @@ func (relay *gameRelayImpl) sendContainerToServer(container common.GameDataConta
 	}
 }
 
-func (relay *gameRelayImpl) shutdown() {
+func (relay *gameDataRelayImpl) shutdown() {
 	for _, proxy := range relay.localProxies {
 		close(proxy.signalChannel)
 		proxy.socket.Close() // Close the socket, since the UDP reads are blocking we need to close the socket to get the goroutines to terminate
@@ -175,7 +175,7 @@ func (relay *gameRelayImpl) shutdown() {
 	log.Debug("All proxy goroutines exited.")
 }
 
-func (relay *gameRelayImpl) relayDataRemoteToLocal() {
+func (relay *gameDataRelayImpl) relayDataRemoteToLocal() {
 	forwarding := false
 	hosting := false
 	defer func() {
@@ -213,10 +213,10 @@ func (relay *gameRelayImpl) relayDataRemoteToLocal() {
 		if err != nil {
 			if websocket.IsCloseError(err) {
 				log.WithError(err).Warn("Remote websocket connection closed by server")
-				relay.onDisconnectedFromServer()
 			} else {
-				log.WithError(err).Warn("Failed to read message from remote websocket connection")
+				log.WithError(err).Error("Failed to read message from remote websocket connection")
 			}
+			relay.onDisconnectedFromServer()
 		} else if msgType == websocket.BinaryMessage && forwarding {
 			container := common.DecodeGameDataContainer(data)
 
@@ -257,7 +257,7 @@ func (relay *gameRelayImpl) relayDataRemoteToLocal() {
 	}
 }
 
-func (relay *gameRelayImpl) onConnectedToServer(address string, auth string) bool {
+func (relay *gameDataRelayImpl) onConnectedToServer(address string, auth string) bool {
 	relay.mutex.Lock()
 	defer relay.mutex.Unlock()
 
@@ -291,9 +291,10 @@ func (relay *gameRelayImpl) onConnectedToServer(address string, auth string) boo
 	return true
 }
 
-func (relay *gameRelayImpl) onDisconnectedFromServer() {
-	relay.mutex.Lock()
+func (relay *gameDataRelayImpl) onDisconnectedFromServer() {
+	relay.mutex.Lock() // TODO: mutex not able to aquire lock here
 	defer relay.mutex.Unlock()
+	// TODO: check if we're actually connected
 
 	for _, proxy := range relay.localProxies {
 		close(proxy.signalChannel)
@@ -307,7 +308,7 @@ func (relay *gameRelayImpl) onDisconnectedFromServer() {
 	relay.localProxies = make(map[uint64]*virtualGameProxy) // Overwrite the map, we don't need the old proxies anymore
 }
 
-func (relay *gameRelayImpl) onBeginHosting() {
+func (relay *gameDataRelayImpl) onBeginHosting() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 
@@ -318,7 +319,7 @@ func (relay *gameRelayImpl) onBeginHosting() {
 	}
 }
 
-func (relay *gameRelayImpl) onStopHosting() {
+func (relay *gameDataRelayImpl) onStopHosting() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 
@@ -331,7 +332,7 @@ func (relay *gameRelayImpl) onStopHosting() {
 	relay.localProxies = make(map[uint64]*virtualGameProxy) // Overwrite the map, we don't need the old proxies anymore
 }
 
-func (relay *gameRelayImpl) onBeginLinked() {
+func (relay *gameDataRelayImpl) onBeginLinked() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 
@@ -350,7 +351,7 @@ func (relay *gameRelayImpl) onBeginLinked() {
 	}
 }
 
-func (relay *gameRelayImpl) onStopLinked() {
+func (relay *gameDataRelayImpl) onStopLinked() {
 	relay.mutex.Lock() // Lock mutex since we're reading the list of local proxies
 	defer relay.mutex.Unlock()
 

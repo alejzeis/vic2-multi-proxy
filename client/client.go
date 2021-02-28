@@ -3,173 +3,188 @@ package client
 import (
 	"bufio"
 	"fmt"
+	"github.com/alejzeis/vic2-multi-proxy/common"
 	"os"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 )
 
-// RunClient is the main method for running the client code
-func RunClient() {
+// Represents a source for commands for the client to process
+// This is implemented with ConsoleCommandSource, but can be something else to source commands from,
+// such as in a GUI application
+type CommandSource interface {
+	// Called by the client to get the next command for it to process.
+	GetNextCommand() string
+}
+
+// Simple Implementation of CommandSource, which just reads commands from stdin
+type ConsoleCommandSource struct {
+	scanner *bufio.Scanner
+}
+
+func NewConsoleCommandSource() *ConsoleCommandSource {
+	ccs := new(ConsoleCommandSource)
+	ccs.scanner = bufio.NewScanner(os.Stdin)
+	return ccs
+}
+
+func (ccs *ConsoleCommandSource) GetNextCommand() string {
+	fmt.Print("> ")
+	ccs.scanner.Scan()
+	return ccs.scanner.Text()
+}
+
+type Client struct {
+	commandSource CommandSource
+	rClient       *restClient
+
+	running bool
+}
+
+func NewClient(commandSource CommandSource, relay GameDataRelay) *Client {
+	client := new(Client)
+	client.commandSource = commandSource
+	client.rClient = newRestClient("", relay)
+	client.running = true
+	return client
+}
+
+// Main loop for processing commands
+func (client *Client) RunClient() {
 	log.Info("Client ready for commands.")
-	scanner := bufio.NewScanner(os.Stdin)
-	relay := createStartRelay()
-	client := createRestClient("", relay)
 
-	for {
-		fmt.Print("> ")
-
-		scanner.Scan()
-		text := scanner.Text()
-
-		if len(text) != 0 {
-			processCommand(text, client, relay, scanner)
+	for client.running {
+		cmd := client.commandSource.GetNextCommand()
+		if len(cmd) != 0 {
+			client.processCommand(cmd)
 		}
 	}
 }
 
-func processCommand(text string, client *restClient, relay gameRelay, scanner *bufio.Scanner) {
+func (client *Client) processCommand(text string) {
+	connected, checkinSnapshot := client.rClient.GetStatus()
+
 	if strings.HasPrefix(text, "connect") {
-		if client.checkConnected() {
+		if connected {
 			log.Error("Already connected to a server, use \"disconnect\" command first")
 		} else {
 			// connect [server] [username]
 			exploded := strings.Split(text, " ")
 			if len(exploded) > 2 {
 				log.WithField("url", exploded[1]).Info("Connecting to server...")
-				client.serverURL = exploded[1]
-				if client.connect(exploded[2]) {
-					if !relay.onConnectedToServer(exploded[1], client.authToken) {
-						// Failed to connect on websocket, so logout from REST api
-						client.disconnect()
-					}
-				}
+				client.rClient.serverURL = exploded[1]
+				client.rClient.Connect(exploded[2])
 			} else {
 				log.Error("Usage: \"connect [URL] [username]\"")
 			}
 		}
 	} else if strings.HasPrefix(text, "disconnect") {
-		if !client.checkConnected() {
-			log.Error("Not connected to a server, use \"connect\" command first")
+		if connected {
+			client.rClient.Logout()
 		} else {
-			client.disconnect()
-			relay.onDisconnectedFromServer()
+			log.Error("Not connected to a server, use \"connect\" command first")
 		}
 	} else if strings.HasPrefix(text, "list") {
-		processListCommand(client)
+		client.processListCommand(connected, checkinSnapshot)
 	} else if strings.HasPrefix(text, "link") {
 		// link [name]
 		exploded := strings.Split(text, " ")
-		if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
-			log.Error("You must be connected to a server and not already linked to a lobby first.")
+		if len(exploded) > 1 {
+			client.processLinkCommand(connected, checkinSnapshot, exploded[1])
 		} else {
-			processLinkCommand(client, relay, exploded[1])
+			log.Error("Usage: \"link [name]\"")
 		}
 	} else if strings.HasPrefix(text, "unlink") {
-		if !client.checkConnected() || client.lastCheckin.LinkedLobby < 1 {
+		if !connected || checkinSnapshot.LinkedLobby < 1 {
 			log.Error("You must be connected to a server and linked to a lobby first.")
 		} else {
-			client.unlink()
-			relay.onStopLinked() // Tell relay to stop emulating the hosted game on localhost
+			client.rClient.Unlink()
 		}
 	} else if strings.HasPrefix(text, "host") {
-		if !client.checkConnected() || client.lastCheckin.LinkedLobby > 0 {
-			log.Error("You must be connected to a server first and not already linked to a lobby in order to host.")
+		exploded := strings.Split(text, " ")
+		if len(exploded) == 2 {
+			client.processHostCommand(connected, checkinSnapshot, exploded[1], "")
+		} else if len(exploded) > 2 {
+			client.processHostCommand(connected, checkinSnapshot, exploded[1], exploded[2])
 		} else {
-			exploded := strings.Split(text, " ")
-			if len(exploded) > 1 {
-				processHostCommand(client, relay, scanner, exploded[1])
-			} else {
-				log.Error("Usage: \"host [start/stop]")
-			}
+			log.Error("Usage: \"host start [lobbyName]\" OR \"host stop\"")
 		}
 	} else {
 		log.Warn("Unknown Command")
 	}
 }
 
-func processListCommand(client *restClient) {
-	client.mutex.Lock()
-	defer client.mutex.Unlock()
-
-	if !client.checkConnectedNoLock() {
-		log.Error("Not connected to a server, use \"connect\" command first")
-	} else {
-		if len(client.lastCheckin.Lobbies) == 0 {
+func (client *Client) processListCommand(connected bool, checkinSnapshot common.CheckinResponse) {
+	if connected {
+		if len(checkinSnapshot.Lobbies) == 0 {
 			log.Info("No lobbies found")
 		} else {
-			for key, val := range client.lastCheckin.Lobbies {
+			for key, val := range checkinSnapshot.Lobbies {
 				log.WithFields(log.Fields{
 					"name": key,
 					"host": val.Host,
 				}).Info("Lobby found")
 			}
 		}
-	}
-}
-
-func processLinkCommand(client *restClient, relay gameRelay, lobbyName string) {
-	client.mutex.Lock()
-
-	foundLobby := ""
-
-	for id, lobby := range client.lastCheckin.Lobbies {
-		if strings.ToLower(lobbyName) == lobby.Name {
-			foundLobby = id
-		}
-	}
-
-	if foundLobby == "" {
-		log.Error("That Lobby wasn't found. Please check spelling, or run \"list\" to see all lobbies")
-		client.mutex.Unlock()
 	} else {
-		log.WithFields(log.Fields{
-			"host": client.lastCheckin.Lobbies[foundLobby].Host,
-			"name": client.lastCheckin.Lobbies[foundLobby].Name,
-		}).Info("OK, linking to lobby.")
-
-		client.mutex.Unlock()
-		client.link(foundLobby)
-		relay.onBeginLinked() // Tell relay to start emulating the hosted game on localhost
+		log.Error("Not connected to a server, use \"connect\" command first")
 	}
 }
 
-func processHostCommand(client *restClient, relay gameRelay, scanner *bufio.Scanner, operation string) {
-	client.mutex.Lock()
+func (client *Client) processLinkCommand(connected bool, checkinSnapshot common.CheckinResponse, lobbyName string) {
+	if connected && !checkinSnapshot.Hosting && checkinSnapshot.LinkedLobby < 1 {
+		foundLobby := ""
 
-	switch operation {
-	case "start":
-		if client.lastCheckin.Hosting {
-			log.Error("You are already hosting a lobby!")
+		for id, lobby := range checkinSnapshot.Lobbies {
+			if strings.ToLower(lobbyName) == lobby.Name {
+				foundLobby = id
+			}
+		}
+
+		if foundLobby == "" {
+			log.Error("That Lobby wasn't found. Please check spelling, or run \"list\" to see all lobbies")
+		} else {
+			log.WithFields(log.Fields{
+				"host": checkinSnapshot.Lobbies[foundLobby].Host,
+				"name": checkinSnapshot.Lobbies[foundLobby].Name,
+			}).Info("OK, linking to lobby.")
+
+			client.rClient.Link(foundLobby)
+		}
+	} else if connected && checkinSnapshot.Hosting {
+		log.Error("You are hosting a lobby, you must not be hosting to link")
+	} else if connected && checkinSnapshot.LinkedLobby > 0 {
+		log.Error("You are already linked to a lobby, unlink first")
+	} else {
+		log.Error("Not connected to a server, use \"connect\" command first")
+	}
+}
+
+func (client *Client) processHostCommand(connected bool, checkinSnapshot common.CheckinResponse, operation string, lobbyName string) {
+	if connected && checkinSnapshot.LinkedLobby < 1 {
+		switch operation {
+		case "start":
+			if checkinSnapshot.Hosting {
+				log.Error("You are already hosting a lobby!")
+			} else {
+				client.rClient.Host(lobbyName, "")
+			}
 			break
-		} else {
-			fmt.Print("Enter the name for your lobby: ")
-			scanner.Scan()
-			lobbyName := scanner.Text()
-
-			fmt.Print("\nEnter a password for the lobby (or leave blank): ")
-			scanner.Scan()
-			password := scanner.Text()
-
-			client.mutex.Unlock()
-			if client.host(lobbyName, password) {
-				relay.onBeginHosting() // Tell relay to start emulating game clients to the local hosted game
+		case "stop":
+			if checkinSnapshot.Hosting {
+				client.rClient.StopHost()
+			} else {
+				log.Error("You aren't hosting a lobby.")
 			}
+			break
+		default:
+			log.Error("Usage: \"host start [lobbyName]\" OR \"host stop\"")
+			break
 		}
-		break
-	case "stop":
-		if !client.lastCheckin.Hosting {
-			log.Error("You aren't hosting a lobby.")
-		} else {
-			client.mutex.Unlock()
-			if client.stopHost() {
-				relay.onStopHosting() // Tell relay to stop emulating game clients to the local hosted game
-			}
-		}
-		break
-	default:
-		log.Error("Usage: host [start/stop]")
-		client.mutex.Unlock()
-		break
+	} else if connected {
+		log.Error("You are linked to a lobby! Unlink first, then try to host")
+	} else {
+		log.Error("Not connected to a server, use \"connect\" command first")
 	}
 }
