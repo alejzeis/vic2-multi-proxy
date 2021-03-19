@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Represents a source for commands for the client to process
+// Represents a source for text commands for the client to process
 // This is implemented with ConsoleCommandSource, but can be something else to source commands from,
 // such as in a GUI application
 type CommandSource interface {
@@ -35,13 +35,18 @@ func (ccs *ConsoleCommandSource) GetNextCommand() string {
 	return ccs.scanner.Text()
 }
 
+// Represents the entire Client that handles connecting to the proxy server and the relay server.
 type Client struct {
+	// CommandSource which is used to obtain commands from the user to process
 	commandSource CommandSource
-	rClient       *restClient
+	// The Client which handles sending REST requests to the proxy server, and also handles initializing the relay code
+	rClient *restClient
 
+	// If the Client's main loop (for processing commands) is running
 	running bool
 }
 
+// Creates a new Client with the specified command Source and GameDataRelay implementation
 func NewClient(commandSource CommandSource, relay GameDataRelay) *Client {
 	client := new(Client)
 	client.commandSource = commandSource

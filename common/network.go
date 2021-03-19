@@ -7,6 +7,7 @@ import (
 	"github.com/gorilla/websocket"
 	"net"
 	"strconv"
+	"sync"
 )
 
 const DefaultVic2GamePort uint16 = 1930
@@ -20,7 +21,7 @@ type GameDataContainer struct {
 func DecodeGameDataContainer(data []byte) GameDataContainer {
 	return GameDataContainer{
 		Identifier: binary.BigEndian.Uint64(data[0:8]),
-		Data:       data[8:(len(data) - 1)],
+		Data:       data[8:],
 	}
 }
 
@@ -44,8 +45,8 @@ type MessageConnection interface {
 	ReadMessage() ([]byte, net.Addr, error)
 	// Sends a message
 	WriteMessage(data []byte) error
-	// Sends a closing message. This isn't guaranteed as some implementations (UDP) may not support this, so it will just do nothing
-	SendCloseMessage(msg string) error
+	// Sends a closing message and closes the connection. Some implementations (UDP) don't support sending a message, but will still close the connection
+	CloseWithMessage(msg string) error
 	// Closes the underlying socket
 	Close() error
 	// Determine if the connection has been closed or not
@@ -56,7 +57,9 @@ type MessageConnection interface {
 type UDPMessageConnection struct {
 	socket      *net.UDPConn
 	peerAddress *net.UDPAddr
-	closed      bool
+
+	isClosedMutex *sync.RWMutex
+	closed        bool
 }
 
 func (connection *UDPMessageConnection) ReadMessage() ([]byte, net.Addr, error) {
@@ -68,7 +71,7 @@ func (connection *UDPMessageConnection) ReadMessage() ([]byte, net.Addr, error) 
 		if connection.peerAddress == nil {
 			connection.peerAddress = addr
 		}
-		return data[0:(length - 1)], addr, nil
+		return data[0:length], addr, nil
 	}
 }
 
@@ -81,23 +84,35 @@ func (connection *UDPMessageConnection) WriteMessage(data []byte) error {
 	}
 }
 
-func (connection *UDPMessageConnection) SendCloseMessage(msg string) error {
-	// Not supported
-	return nil
+func (connection *UDPMessageConnection) CloseWithMessage(msg string) error {
+	// Message Not supported
+	return connection.Close()
 }
 
 func (connection *UDPMessageConnection) Close() error {
-	connection.closed = true
-	return connection.socket.Close()
+	connection.isClosedMutex.Lock()
+	defer connection.isClosedMutex.Unlock()
+
+	if !connection.closed {
+		connection.closed = true
+		return connection.socket.Close()
+	} else {
+		return errors.New("connection already closed")
+	}
 }
 
 func (connection *UDPMessageConnection) IsClosed() bool {
+	connection.isClosedMutex.RLock()
+	defer connection.isClosedMutex.RUnlock()
+
 	return connection.closed
 }
 
 type WebsocketMessageConnection struct {
 	socket *websocket.Conn
 	closed bool
+
+	isClosedMutex *sync.RWMutex
 }
 
 func (connection *WebsocketMessageConnection) ReadMessage() ([]byte, net.Addr, error) {
@@ -112,23 +127,35 @@ func (connection *WebsocketMessageConnection) WriteMessage(data []byte) error {
 	return connection.socket.WriteMessage(websocket.BinaryMessage, data)
 }
 
-func (connection *WebsocketMessageConnection) SendCloseMessage(msg string) error {
+func (connection *WebsocketMessageConnection) CloseWithMessage(msg string) error {
 	err := connection.socket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, msg))
-	connection.closed = true
-	// TODO: also actually close socket?
-	return err
+	if err != nil {
+		return err
+	} else {
+		return connection.Close()
+	}
 }
 
 func (connection *WebsocketMessageConnection) Close() error {
-	connection.closed = true
-	return connection.socket.Close()
+	connection.isClosedMutex.Lock()
+	defer connection.isClosedMutex.Unlock()
+
+	if !connection.closed {
+		connection.closed = true
+		return connection.socket.Close()
+	} else {
+		return errors.New("connection already closed")
+	}
 }
 
 func (connection *WebsocketMessageConnection) IsClosed() bool {
+	connection.isClosedMutex.RLock()
+	defer connection.isClosedMutex.RUnlock()
+
 	return connection.closed
 }
 
-// Abstracts the process of creating MessageConnections
+// Represents a source for creating MessageConnections, for listening locally and also connecting to remote addresses
 type MessageConnectionProvider interface {
 	// Creates and returns a new MessageConnection to listen on a certain port on the local machine
 	ObtainLocalListener(port uint) (MessageConnection, error)
@@ -152,6 +179,8 @@ func (provider *RelayMessageConnectionProvider) ObtainLocalListener(port uint) (
 		} else {
 			udpMsgCon := new(UDPMessageConnection)
 			udpMsgCon.socket = listener
+			udpMsgCon.isClosedMutex = new(sync.RWMutex)
+			udpMsgCon.closed = false
 			return udpMsgCon, nil
 		}
 	}
@@ -164,6 +193,8 @@ func (provider *RelayMessageConnectionProvider) DialForConnection(address string
 	} else {
 		wsMsgCon := new(WebsocketMessageConnection)
 		wsMsgCon.socket = webConn
+		wsMsgCon.isClosedMutex = new(sync.RWMutex)
+		wsMsgCon.closed = false
 		return wsMsgCon, nil
 	}
 }
